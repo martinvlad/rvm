@@ -16,7 +16,10 @@ crate-type = ["rlib"]
 [dependencies]
 # Pinned: 0.243.0 is the newest wasmparser whose MSRV (1.76) fits the workspace
 # MSRV 1.77; later releases need 1.81+. no_std: default features are off and only
-# `validate` is enabled (no serde, no component-model, no hash-collections).
+# `validate` and `features` are enabled (no serde, no component-model, no
+# hash-collections). `features` is needed so `WasmFeatures::WASM2` can be
+# pinned and handed to the parser (`Parser::set_features`); without it the
+# feature set is wasmparser's compile-time default and cannot be pinned.
 wasmparser = { version = "=0.243.0", default-features = false, features = ["validate", "features"], optional = true }
 rvm-types = { workspace = true }
 rvm-partition = { workspace = true }
