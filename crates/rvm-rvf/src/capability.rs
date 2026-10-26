@@ -322,13 +322,31 @@ pub fn map_declared(declared: &[CapabilityClass]) -> RvfResult<CapabilityMapping
 /// can only narrow the granted set.
 #[must_use]
 pub fn declared_classes(data: &[u8], segments: &[ParsedSegment]) -> Vec<CapabilityClass> {
+    declared_classes_in(plaintext_meta(data, segments))
+}
+
+/// The plaintext `META` payloads of a walked container.
+fn plaintext_meta<'a>(
+    data: &'a [u8],
+    segments: &'a [ParsedSegment],
+) -> impl Iterator<Item = &'a [u8]> + Clone {
+    segments
+        .iter()
+        .filter(|s| s.header.seg_type == SEG_TYPE_META && !s.header.is_encrypted())
+        .map(move |s| s.payload(data))
+}
+
+/// [`declared_classes`] over already-selected plaintext `META` payloads, so a
+/// streaming consumer that never holds the whole container reads the same
+/// declaration the buffered path does.
+#[must_use]
+pub(crate) fn declared_classes_in<'a>(
+    payloads: impl Iterator<Item = &'a [u8]>,
+) -> Vec<CapabilityClass> {
     let mut found: Vec<CapabilityClass> = Vec::new();
 
-    for seg in segments {
-        if seg.header.seg_type != SEG_TYPE_META || seg.header.is_encrypted() {
-            continue;
-        }
-        let Ok(text) = core::str::from_utf8(seg.payload(data)) else {
+    for payload in payloads {
+        let Ok(text) = core::str::from_utf8(payload) else {
             continue;
         };
         for line in text.lines() {
@@ -354,12 +372,9 @@ pub fn declared_classes(data: &[u8], segments: &[ParsedSegment]) -> Vec<Capabili
 
 /// Whether a plaintext capability declaration contains a non-empty name that
 /// this RVM version does not understand.
-pub(crate) fn has_unknown_class_name(data: &[u8], segments: &[ParsedSegment]) -> bool {
-    segments.iter().any(|seg| {
-        if seg.header.seg_type != SEG_TYPE_META || seg.header.is_encrypted() {
-            return false;
-        }
-        let Ok(text) = core::str::from_utf8(seg.payload(data)) else {
+pub(crate) fn has_unknown_class_name_in<'a>(mut payloads: impl Iterator<Item = &'a [u8]>) -> bool {
+    payloads.any(|payload| {
+        let Ok(text) = core::str::from_utf8(payload) else {
             return false;
         };
         text.lines().any(|line| {
@@ -373,6 +388,12 @@ pub(crate) fn has_unknown_class_name(data: &[u8], segments: &[ParsedSegment]) ->
                 })
         })
     })
+}
+
+/// [`has_unknown_class_name_in`] for a walked container.
+#[cfg(test)]
+pub(crate) fn has_unknown_class_name(data: &[u8], segments: &[ParsedSegment]) -> bool {
+    has_unknown_class_name_in(plaintext_meta(data, segments))
 }
 
 #[cfg(test)]

@@ -325,15 +325,24 @@ pub fn decode_signature_footer(data: &[u8]) -> RvfResult<SignatureFooter<'_>> {
 /// shake256_128(payload)`. The length is fixed, so this allocates nothing.
 #[must_use]
 pub fn build_signed_message(header: &SegmentHeader, payload: &[u8]) -> [u8; SIGNED_MESSAGE_LEN] {
+    build_signed_message_from_hash(header, &crate::hash::shake256_128(payload))
+}
+
+/// [`build_signed_message`] when the SHAKE-256-128 of the payload is already
+/// known, so a streaming reader never needs the payload twice.
+#[must_use]
+pub fn build_signed_message_from_hash(
+    header: &SegmentHeader,
+    payload_hash: &[u8; 16],
+) -> [u8; SIGNED_MESSAGE_LEN] {
     let header_bytes = header.to_bytes();
-    let payload_hash = crate::hash::shake256_128(payload);
 
     let mut msg = [0u8; SIGNED_MESSAGE_LEN];
     msg[0..40].copy_from_slice(&header_bytes[..40]);
     msg[40..56].copy_from_slice(&header.content_hash);
     msg[56..70].copy_from_slice(SIGN_CONTEXT);
     msg[70..78].copy_from_slice(&header.segment_id.to_le_bytes());
-    msg[78..94].copy_from_slice(&payload_hash);
+    msg[78..94].copy_from_slice(payload_hash);
     msg
 }
 

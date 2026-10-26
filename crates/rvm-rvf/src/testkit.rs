@@ -12,6 +12,8 @@
 //! [ 64-byte header ][ payload ][ signature footer, if SIGNED ][ zero pad to 64 ]
 //! ```
 
+#![allow(clippy::must_use_candidate, clippy::missing_panics_doc)]
+
 use crate::format::{
     compute_footer_length, FLAG_SIGNED, SEGMENT_ALIGNMENT, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC,
     SEGMENT_VERSION, SIG_ALGO_ED25519,
@@ -47,8 +49,9 @@ fn header_bytes(
     flags: u16,
     segment_id: u64,
     alignment_pad: u32,
+    algo: u8,
 ) -> [u8; SEGMENT_HEADER_SIZE] {
-    let content_hash = crate::hash::content_hash(CHECKSUM_ALGO, payload);
+    let content_hash = crate::hash::content_hash(algo, payload);
 
     let mut b = [0u8; SEGMENT_HEADER_SIZE];
     b[0x00..0x04].copy_from_slice(&SEGMENT_MAGIC.to_le_bytes());
@@ -58,7 +61,7 @@ fn header_bytes(
     b[0x08..0x10].copy_from_slice(&segment_id.to_le_bytes());
     b[0x10..0x18].copy_from_slice(&(payload.len() as u64).to_le_bytes());
     // timestamp_ns stays zero: fixtures must be byte-reproducible.
-    b[0x20] = CHECKSUM_ALGO;
+    b[0x20] = algo;
     b[0x28..0x38].copy_from_slice(&content_hash);
     b[0x3C..0x40].copy_from_slice(&alignment_pad.to_le_bytes());
     b
@@ -69,30 +72,50 @@ fn pad_to_alignment(buf: &mut Vec<u8>) {
     buf.resize(padded, 0);
 }
 
-/// Build an unsigned segment.
+/// Build an unsigned segment with the writer's default checksum (XXH3-128).
 pub fn unsigned_segment(seg_type: u8, payload: &[u8], segment_id: u64) -> Vec<u8> {
+    unsigned_segment_with(seg_type, payload, segment_id, CHECKSUM_ALGO)
+}
+
+/// Build an unsigned segment with checksum algorithm `algo` (2 = SHAKE-256-128).
+pub fn unsigned_segment_with(seg_type: u8, payload: &[u8], segment_id: u64, algo: u8) -> Vec<u8> {
     let unpadded = SEGMENT_HEADER_SIZE + payload.len();
     let pad = unpadded.div_ceil(SEGMENT_ALIGNMENT) * SEGMENT_ALIGNMENT - unpadded;
 
     let mut out = Vec::new();
-    out.extend_from_slice(&header_bytes(seg_type, payload, 0, segment_id, pad as u32));
+    out.extend_from_slice(&header_bytes(
+        seg_type, payload, 0, segment_id, pad as u32, algo,
+    ));
     out.extend_from_slice(payload);
     pad_to_alignment(&mut out);
     out
 }
 
-/// Build a segment carrying a real Ed25519 signature footer over `payload`.
+/// Build a segment carrying a real Ed25519 signature footer over `payload`,
+/// with the writer's default checksum (XXH3-128).
 pub fn signed_segment(
     seg_type: u8,
     payload: &[u8],
     segment_id: u64,
     keypair: &TestKeypair,
 ) -> Vec<u8> {
+    signed_segment_with(seg_type, payload, segment_id, keypair, CHECKSUM_ALGO)
+}
+
+/// [`signed_segment`] with checksum algorithm `algo` (2 = SHAKE-256-128, the
+/// only kind the stream path accepts for an executable).
+pub fn signed_segment_with(
+    seg_type: u8,
+    payload: &[u8],
+    segment_id: u64,
+    keypair: &TestKeypair,
+    algo: u8,
+) -> Vec<u8> {
     let footer_len = compute_footer_length(64) as usize;
     let unpadded = SEGMENT_HEADER_SIZE + payload.len() + footer_len;
     let pad = unpadded.div_ceil(SEGMENT_ALIGNMENT) * SEGMENT_ALIGNMENT - unpadded;
 
-    let head = header_bytes(seg_type, payload, FLAG_SIGNED, segment_id, pad as u32);
+    let head = header_bytes(seg_type, payload, FLAG_SIGNED, segment_id, pad as u32, algo);
     let header = crate::format::SegmentHeader::parse(&head).expect("testkit built a valid header");
     let msg = crate::format::build_signed_message(&header, payload);
     let signature = keypair.signing.sign(&msg).to_bytes();
@@ -121,6 +144,7 @@ pub fn signed_flag_without_footer(seg_type: u8, payload: &[u8], segment_id: u64)
         FLAG_SIGNED,
         segment_id,
         pad as u32,
+        CHECKSUM_ALGO,
     ));
     out.extend_from_slice(payload);
     pad_to_alignment(&mut out);

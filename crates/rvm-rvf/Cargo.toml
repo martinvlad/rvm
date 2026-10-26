@@ -24,9 +24,17 @@ xxhash-rust = { workspace = true }
 ed25519-dalek = { version = "=2.1.1", default-features = false }
 
 [dev-dependencies]
+serde_json = "1"
+peak_alloc = "0.2"
+proptest = { workspace = true }
+# The streaming tests build descriptors with the producer-side helpers.
+rvm-rvf = { path = ".", features = ["testkit"] }
 
 [features]
 default = []
+# Producer-side helpers (descriptor builder, synthetic containers) for tests and
+# benches in downstream crates. Never enabled in a production dependency graph.
+testkit = []
 std = [
     "rvm-types/std",
     "rvm-cap/std",

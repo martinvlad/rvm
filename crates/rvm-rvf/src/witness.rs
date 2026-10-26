@@ -71,21 +71,40 @@ pub fn build_record(
     rvf_identity: &[u8; 32],
     ctx: WitnessContext,
 ) -> WitnessRecord {
+    let mut payload = [0u8; 8];
+    payload.copy_from_slice(&rvf_identity[..8]);
+    build_record_with_payload(record, rvf_identity, payload, ctx)
+}
+
+/// [`build_record`] with an explicit 8-byte `payload`, for records whose
+/// subject is not the container identity (a stream segment's root, say).
+/// `binding` still binds the record to the artifact through `capability_hash`.
+///
+/// `aux[6..8]` carries the numeric stream error code of the record's detail
+/// (zero when it has none).
+#[must_use]
+pub fn build_record_with_payload(
+    record: &VerificationRecord,
+    binding: &[u8; 32],
+    payload: [u8; 8],
+    ctx: WitnessContext,
+) -> WitnessRecord {
     let mut r = WitnessRecord::zeroed();
     r.action_kind = action_kind_for(record.outcome) as u8;
     r.proof_tier = 2;
     r.flags = record.check as u8;
     r.actor_partition_id = ctx.actor_partition_id;
     r.target_object_id = record.segment_id.unwrap_or(0);
-    r.capability_hash = fnv1a_32(rvf_identity);
+    r.capability_hash = fnv1a_32(binding);
     r.timestamp_ns = ctx.timestamp_ns;
-    r.payload.copy_from_slice(&rvf_identity[..8]);
+    r.payload = payload;
 
     // aux: segment index (4 bytes LE), segment type, detail discriminant.
     let index = u32::try_from(record.segment_index.unwrap_or(0)).unwrap_or(u32::MAX);
     r.aux[0..4].copy_from_slice(&index.to_le_bytes());
     r.aux[4] = record.segment_type;
     r.aux[5] = record.outcome as u8;
+    r.aux[6..8].copy_from_slice(&record.detail.stream_error_code().to_le_bytes());
     r
 }
 
@@ -272,6 +291,11 @@ mod tests {
             CheckKind::Signature,
             CheckKind::SizePolicy,
             CheckKind::CapabilityMapping,
+            CheckKind::StreamProfile,
+            CheckKind::StreamDescriptor,
+            CheckKind::StreamSegment,
+            CheckKind::StreamPoisoned,
+            CheckKind::StreamComplete,
         ] {
             assert!(emits_a_record_for(check));
         }
