@@ -57,6 +57,9 @@ pub struct StreamBuilder {
     pub identity: bool,
     /// Set `require_complete_before_exec`.
     pub require_complete: bool,
+    /// Sign this identity instead of the body's real SHA-256 (a descriptor
+    /// that lies about the identity, for tests).
+    pub identity_override: Option<[u8; 32]>,
     /// Frame delivery order.
     pub order: Order,
     /// Stage assignment.
@@ -106,6 +109,7 @@ impl StreamBuilder {
             policy_hash: [0xAB; 32],
             identity: true,
             require_complete: false,
+            identity_override: None,
             order: Order::File,
             stages: Stages::Flat,
         }
@@ -230,7 +234,11 @@ impl StreamBuilder {
             file_id: self.file_id,
             epoch: self.epoch,
             body_len: body.len() as u64,
-            rvf_identity: if self.identity { sha256(body) } else { [0; 32] },
+            rvf_identity: if self.identity {
+                self.identity_override.unwrap_or_else(|| sha256(body))
+            } else {
+                [0; 32]
+            },
             policy_hash: self.policy_hash,
             seg_count: entries.len() as u32,
             expires_ns: self.expires_ns,

@@ -55,6 +55,8 @@ pub enum CheckKind {
     StreamPoisoned = 10,
     /// Every segment of a stream verified and the byte count matched.
     StreamComplete = 11,
+    /// A streamed executable module passed or failed incremental validation.
+    StreamModule = 12,
 }
 
 /// The result of one check.

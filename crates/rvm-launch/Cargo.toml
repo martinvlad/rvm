@@ -16,13 +16,18 @@ crate-type = ["rlib"]
 [dependencies]
 rvm-types = { workspace = true }
 rvm-witness = { workspace = true }
-rvm-wasm = { workspace = true }
+rvm-wasm = { workspace = true, features = ["alloc"] }
+rvm-cap = { workspace = true }
 rvm-rvf = { workspace = true }
 rvm-host = { workspace = true }
 rvm-context = { workspace = true }
 
 [dev-dependencies]
 rvm-host = { workspace = true, features = ["testkit"] }
+rvm-rvf = { workspace = true, features = ["testkit"] }
+wat = "=1.243.0"
+peak_alloc = "0.2"
+proptest = { workspace = true }
 
 [features]
 default = []
@@ -30,6 +35,7 @@ std = [
     "rvm-types/std",
     "rvm-witness/std",
     "rvm-wasm/std",
+    "rvm-cap/std",
     "rvm-rvf/std",
     "rvm-host/std",
     "rvm-context/std",

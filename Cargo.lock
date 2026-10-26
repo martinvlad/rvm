@@ -2862,12 +2862,16 @@ dependencies = [
 name = "rvm-launch"
 version = "0.1.1"
 dependencies = [
+ "peak_alloc",
+ "proptest",
+ "rvm-cap",
  "rvm-context",
  "rvm-host",
  "rvm-rvf",
  "rvm-types",
  "rvm-wasm",
  "rvm-witness",
+ "wat",
 ]
 
 [[package]]

@@ -91,7 +91,10 @@ pub mod context;
 pub mod error;
 pub mod inspect;
 pub mod instance;
+mod instance_stream;
 pub mod state;
+pub mod stream_module;
+pub mod stream_session;
 pub mod witness;
 
 pub use checkpoint::Checkpoint;
@@ -100,6 +103,10 @@ pub use error::{LaunchError, LaunchResult};
 pub use inspect::{inspect, verify, Inspection, SegmentSummary};
 pub use instance::Instance;
 pub use state::{is_legal, InstanceId, InstanceState, LifecycleOp};
+pub use stream_module::VerifiedModule;
+pub use stream_session::{
+    module_policy_for, PoisonReport, SessionError, SessionEvent, SessionState, StreamSession,
+};
 pub use witness::{build_record, emit, emit_illegal, event_of, LaunchEvent, LaunchWitnessContext};
 
 /// The version of the lifecycle contract this crate implements.

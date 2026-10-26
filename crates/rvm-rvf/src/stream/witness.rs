@@ -13,7 +13,9 @@
 //! | `SegmentVerified(seg_id, root)` | `StreamSegment` | pass | `seg_id` | root\[..8\] | |
 //! | `StreamPoisoned(seg_id, chunk_index, reason)` | `StreamPoisoned` | fail | `seg_id` | binding\[..8\] | `aux[0..4]` = chunk index, `aux[6..8]` = reason code |
 //!
-//! A fifth record, `StreamComplete`, marks the stream finishing.
+//! `StreamComplete` marks the stream finishing, and `ModuleValidated` /
+//! `ModuleRejected` record the verdict of the incremental module validator
+//! that consumes a streamed executable.
 //!
 //! `capability_hash` is the FNV-1a fold of the package identity when the
 //! descriptor commits to one, else of the descriptor hash, so a stream's
@@ -61,6 +63,16 @@ pub enum StreamEvent {
     },
     /// The stream completed.
     StreamComplete,
+    /// A streamed executable module passed incremental validation.
+    ModuleValidated {
+        /// The segment carrying the module.
+        seg_id: u64,
+    },
+    /// A streamed executable module failed validation or policy.
+    ModuleRejected {
+        /// The segment carrying the module.
+        seg_id: u64,
+    },
 }
 
 /// The `(record, payload)` pair for an event.
@@ -124,6 +136,26 @@ pub fn event_record(ev: &StreamEvent, binding: &[u8; 32]) -> (VerificationRecord
                 seg_id,
                 chunk_index as usize,
                 DetailCode::StreamRefused(reason),
+            ),
+            head(binding),
+        ),
+        StreamEvent::ModuleValidated { seg_id } => (
+            rec(
+                CheckKind::StreamModule,
+                Outcome::Pass,
+                Some(seg_id),
+                0,
+                DetailCode::StreamModuleValidated,
+            ),
+            head(binding),
+        ),
+        StreamEvent::ModuleRejected { seg_id } => (
+            rec(
+                CheckKind::StreamModule,
+                Outcome::Fail,
+                Some(seg_id),
+                0,
+                DetailCode::StreamModuleRejected,
             ),
             head(binding),
         ),
@@ -240,7 +272,11 @@ pub fn push_witnessed<'a, const N: usize>(
     result
 }
 
-fn binding_of(adm: &StreamAdmission<'_>) -> Option<[u8; 32]> {
+/// The 32-byte value stream records bind to: the package identity when the
+/// descriptor commits to one, else the descriptor hash. `None` before a
+/// descriptor is accepted.
+#[must_use]
+pub fn binding_of(adm: &StreamAdmission<'_>) -> Option<[u8; 32]> {
     let d = adm.verifier().descriptor()?;
     Some(
         if d.header.flags & super::descriptor::FLAG_IDENTITY_PRESENT != 0 {

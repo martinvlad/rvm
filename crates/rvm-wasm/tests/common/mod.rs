@@ -1,6 +1,8 @@
 //! Shared module builders for the streaming-validator tests and bench.
 #![allow(dead_code)]
 
+pub mod corpus;
+
 pub const HEADER: [u8; 8] = [0, 0x61, 0x73, 0x6d, 1, 0, 0, 0];
 
 pub fn leb(mut v: u32) -> Vec<u8> {

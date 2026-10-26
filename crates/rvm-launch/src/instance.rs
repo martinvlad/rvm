@@ -36,14 +36,19 @@ type SeqRange = (u64, u64);
 #[derive(Debug)]
 pub struct Instance<A: HostAdapter> {
     id: InstanceId,
-    adapter: A,
-    package: VerifiedPackage,
-    isolation: IsolationContext,
-    state: InstanceState,
-    agent: Option<AgentId>,
+    pub(crate) adapter: A,
+    pub(crate) package: VerifiedPackage,
+    pub(crate) isolation: IsolationContext,
+    pub(crate) state: InstanceState,
+    pub(crate) agent: Option<AgentId>,
     checkpoints: u32,
-    ranges: Vec<SeqRange>,
+    pub(crate) ranges: Vec<SeqRange>,
     context_authorization: Option<ContextLaunchAuthorization>,
+    /// The module bytes this instance was started with through
+    /// [`Self::start_verified`], held in the instance's own storage.
+    pub(crate) module: Option<Vec<u8>>,
+    /// The descriptor hash of the stream this instance was started from.
+    pub(crate) stream_origin: Option<[u8; 32]>,
 }
 
 impl<A: HostAdapter> Instance<A> {
@@ -94,6 +99,8 @@ impl<A: HostAdapter> Instance<A> {
             checkpoints: 0,
             ranges: alloc::vec![(start, log.total_emitted())],
             context_authorization: None,
+            module: None,
+            stream_origin: None,
         })
     }
 
@@ -424,7 +431,7 @@ impl<A: HostAdapter> Instance<A> {
         record.capability_hash == fnv1a_32(self.package.identity())
     }
 
-    fn witness_context(&self, timestamp_ns: u64) -> LaunchWitnessContext {
+    pub(crate) fn witness_context(&self, timestamp_ns: u64) -> LaunchWitnessContext {
         LaunchWitnessContext {
             instance: self.id,
             rvf_identity: *self.package.identity(),
@@ -435,7 +442,7 @@ impl<A: HostAdapter> Instance<A> {
 
     /// Refuse an operation the state machine does not allow, witnessing the
     /// refusal first.
-    fn guard<const N: usize>(
+    pub(crate) fn guard<const N: usize>(
         &mut self,
         op: LifecycleOp,
         log: &WitnessLog<N>,
@@ -453,13 +460,13 @@ impl<A: HostAdapter> Instance<A> {
         })
     }
 
-    fn record_range(&mut self, start: u64, end: u64) {
+    pub(crate) fn record_range(&mut self, start: u64, end: u64) {
         if end > start {
             self.ranges.push((start, end));
         }
     }
 
-    fn guard_executable<const N: usize>(
+    pub(crate) fn guard_executable<const N: usize>(
         &mut self,
         module: &[u8],
         log: &WitnessLog<N>,

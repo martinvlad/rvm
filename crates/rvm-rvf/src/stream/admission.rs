@@ -214,11 +214,32 @@ impl<'p> StreamAdmission<'p> {
         }
     }
 
+    /// [`StreamVerifier::finish_identity`] on the wrapped verifier.
+    ///
+    /// # Errors
+    ///
+    /// As the verifier; a mismatch poisons the stream.
+    pub fn finish_identity(
+        &mut self,
+        read_at: impl FnMut(u64, &mut [u8]) -> bool,
+    ) -> Result<(), StreamError> {
+        self.verifier.finish_identity(read_at)
+    }
+
+    /// Drop everything derived from released bytes: open segment checkers,
+    /// collected metadata and finished segment facts. Called when a stream is
+    /// poisoned; the verifier itself is already terminal.
+    pub fn discard_derived_state(&mut self) {
+        self.open.clear();
+        self.meta.clear();
+        self.done.clear();
+        self.report = None;
+    }
+
     fn fail(&mut self, e: AdmissionError, seg: Option<u64>, chunk: u32) -> AdmissionError {
         self.verifier
             .poison_at(StreamError::TableInvalid, seg, chunk);
-        self.open.clear();
-        self.meta.clear();
+        self.discard_derived_state();
         self.failure = Some(e);
         e
     }

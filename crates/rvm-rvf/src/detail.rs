@@ -60,6 +60,10 @@ pub enum DetailCode {
     StreamSegmentAccepted,
     /// A stream completed.
     StreamCompleted,
+    /// A streamed module passed incremental validation under policy.
+    StreamModuleValidated,
+    /// A streamed module failed incremental validation or policy.
+    StreamModuleRejected,
     /// A stream descriptor or frame was refused, for this reason.
     StreamRefused(StreamError),
 }
@@ -108,6 +112,8 @@ impl fmt::Display for DetailCode {
             Self::StreamDescriptorAccepted => "stream descriptor passed every invariant",
             Self::StreamSegmentAccepted => "every chunk of the segment matched its commitment",
             Self::StreamCompleted => "stream completed",
+            Self::StreamModuleValidated => "streamed module validated under policy",
+            Self::StreamModuleRejected => "streamed module failed validation or policy",
             Self::StreamRefused(_) => "stream descriptor or frame refused",
         };
         f.write_str(s)
