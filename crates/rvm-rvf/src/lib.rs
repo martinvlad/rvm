@@ -107,7 +107,10 @@ pub use capability::{
     declared_classes, map_declared, CapabilityClass, CapabilityMapping, RvmBinding,
     CAPABILITY_DECLARATION_KEY,
 };
-pub use container::{root_manifest, walk, ParsedSegment};
+pub use container::{
+    root_manifest, walk, walk_container, ParsedSegment, WalkedContainer, ROOT_PAGE_MAGIC,
+    ROOT_PAGE_SIZE,
+};
 pub use detail::DetailCode;
 pub use error::{RvfError, RvfResult};
 pub use format::{

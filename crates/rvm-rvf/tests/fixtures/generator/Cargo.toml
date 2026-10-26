@@ -1,0 +1,20 @@
+# Throwaway generator for the checked-in RVF compat fixtures. NOT a workspace
+# member (own empty [workspace]); see ../README.md for how to run it.
+[package]
+name = "rvm-rvf-fixture-gen"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "gen"
+path = "main.rs"
+
+[dependencies]
+rvf-runtime = { path = "/data/scratch/ofer-wt/ruvector/crates/rvf/rvf-runtime" }
+rvf-types = { path = "/data/scratch/ofer-wt/ruvector/crates/rvf/rvf-types", features = ["std", "ed25519"] }
+rvf-forge-core = { path = "/data/scratch/ofer-wt/ruvector/crates/rvf-forge-core" }
+tempfile = "3"
+ed25519-dalek = "2"

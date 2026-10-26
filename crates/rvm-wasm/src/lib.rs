@@ -47,6 +47,18 @@ pub mod host_functions;
 pub mod migration;
 pub mod quota;
 
+#[cfg(feature = "alloc")]
+pub mod module_policy;
+#[cfg(feature = "alloc")]
+pub mod streaming;
+
+#[cfg(feature = "alloc")]
+pub use module_policy::{
+    AllowedImport, ImportKind, ImportPolicy, ImportRef, Limit, ModuleError, ModulePolicy,
+};
+#[cfg(feature = "alloc")]
+pub use streaming::{wasm_features, StreamingModuleValidator, ValidatedModule, ValidatorProgress};
+
 use rvm_types::{PartitionId, RvmError, RvmResult};
 
 /// Maximum Wasm module size in bytes (1 MiB default).
@@ -110,9 +122,35 @@ pub enum WasmSectionId {
     Data = 11,
     /// Data count section (bulk memory proposal).
     DataCount = 12,
+    /// Tag section (exception-handling proposal). Framing only: the streaming
+    /// validator rejects it unless the feature set enables exceptions.
+    Tag = 13,
 }
 
 impl WasmSectionId {
+    /// Position of this section in the binary format's required order. The
+    /// numeric id is not that order: data count (12) precedes code (10) and
+    /// data (11), and tag (13) sits between memory and global.
+    #[must_use]
+    pub const fn order_rank(self) -> u8 {
+        match self {
+            Self::Custom => 0,
+            Self::Type => 1,
+            Self::Import => 2,
+            Self::Function => 3,
+            Self::Table => 4,
+            Self::Memory => 5,
+            Self::Tag => 6,
+            Self::Global => 7,
+            Self::Export => 8,
+            Self::Start => 9,
+            Self::Element => 10,
+            Self::DataCount => 11,
+            Self::Code => 12,
+            Self::Data => 13,
+        }
+    }
+
     /// Try to parse a section ID from a raw byte.
     #[must_use]
     pub const fn from_u8(val: u8) -> Option<Self> {
@@ -130,6 +168,7 @@ impl WasmSectionId {
             10 => Some(Self::Code),
             11 => Some(Self::Data),
             12 => Some(Self::DataCount),
+            13 => Some(Self::Tag),
             _ => None,
         }
     }
@@ -155,12 +194,16 @@ pub struct WasmValidationResult {
     pub total_payload_bytes: u32,
 }
 
-/// Validate a Wasm module: header + section structure.
+/// Validate a Wasm module: header + section structure. **Cheap framing
+/// pre-check only**: it does not parse section contents, validate function
+/// bodies or apply policy. Use `StreamingModuleValidator` (feature `alloc`)
+/// for real validation.
 ///
 /// Checks:
 /// 1. Magic number (`\0asm`) and version (1)
 /// 2. Each section has a valid ID and its declared size fits within the module
-/// 3. Section IDs are non-decreasing (except custom sections)
+/// 3. Non-custom sections appear in the binary format's order (see
+///    [`WasmSectionId::order_rank`]; custom sections may appear anywhere)
 /// 4. No duplicate non-custom sections
 ///
 /// Returns a summary of the sections found.
@@ -183,8 +226,8 @@ pub fn validate_module(bytes: &[u8]) -> RvmResult<WasmValidationResult> {
 
     let mut result = WasmValidationResult::default();
     let mut pos = 8;
-    let mut last_non_custom_id: Option<u8> = None;
-    let mut seen_sections: u16 = 0; // bitmask for section IDs 0-12
+    let mut last_non_custom_rank: Option<u8> = None;
+    let mut seen_sections: u16 = 0; // bitmask for section IDs 0-13
 
     while pos < bytes.len() {
         // Read section ID.
@@ -207,8 +250,8 @@ pub fn validate_module(bytes: &[u8]) -> RvmResult<WasmValidationResult> {
 
         // Enforce ordering: non-custom sections must be non-decreasing.
         if section_id != WasmSectionId::Custom {
-            if let Some(last) = last_non_custom_id {
-                if section_id_byte <= last {
+            if let Some(last) = last_non_custom_rank {
+                if section_id.order_rank() <= last {
                     return Err(RvmError::ProofInvalid);
                 }
             }
@@ -218,7 +261,7 @@ pub fn validate_module(bytes: &[u8]) -> RvmResult<WasmValidationResult> {
                 return Err(RvmError::ProofInvalid);
             }
             seen_sections |= bit;
-            last_non_custom_id = Some(section_id_byte);
+            last_non_custom_rank = Some(section_id.order_rank());
         }
 
         // Track which sections are present.
@@ -324,6 +367,31 @@ mod tests {
         let result = validate_module(&bytes);
         // Should pass the size check. The Custom section is valid (zeroed payload).
         assert!(result.is_ok());
+    }
+
+    fn with_sections(ids: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec::Vec::from(minimal_wasm());
+        for id in ids {
+            v.extend_from_slice(&[*id, 0x00]);
+        }
+        v
+    }
+
+    #[test]
+    fn test_data_count_before_code_is_valid_order() {
+        // Binary order: ... element(9), data count(12), code(10), data(11).
+        assert!(validate_module(&with_sections(&[9, 12, 10, 11])).is_ok());
+        assert!(validate_module(&with_sections(&[10, 12])).is_err());
+    }
+
+    #[test]
+    fn test_tag_section_framing_and_order() {
+        // Tag (13) sits between memory (5) and global (6).
+        assert!(validate_module(&with_sections(&[5, 13, 6])).is_ok());
+        assert!(validate_module(&with_sections(&[6, 13])).is_err());
+        assert!(validate_module(&with_sections(&[13, 13])).is_err());
+        assert_eq!(WasmSectionId::from_u8(13), Some(WasmSectionId::Tag));
+        assert_eq!(WasmSectionId::from_u8(14), None);
     }
 
     #[test]

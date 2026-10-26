@@ -14,6 +14,10 @@ categories = ["no-std", "embedded", "wasm"]
 crate-type = ["rlib"]
 
 [dependencies]
+# Pinned: 0.243.0 is the newest wasmparser whose MSRV (1.76) fits the workspace
+# MSRV 1.77; later releases need 1.81+. no_std: default features are off and only
+# `validate` is enabled (no serde, no component-model, no hash-collections).
+wasmparser = { version = "=0.243.0", default-features = false, features = ["validate", "features"], optional = true }
 rvm-types = { workspace = true }
 rvm-partition = { workspace = true }
 rvm-cap = { workspace = true }
@@ -22,5 +26,22 @@ rvm-witness = { workspace = true }
 [features]
 default = []
 gpu = []
-std = ["rvm-types/std", "rvm-partition/std", "rvm-cap/std", "rvm-witness/std"]
-alloc = ["rvm-types/alloc", "rvm-partition/alloc", "rvm-cap/alloc", "rvm-witness/alloc"]
+std = ["alloc", "wasmparser?/std", "rvm-types/std", "rvm-partition/std", "rvm-cap/std", "rvm-witness/std"]
+alloc = ["dep:wasmparser", "rvm-types/alloc", "rvm-partition/alloc", "rvm-cap/alloc", "rvm-witness/alloc"]
+
+[dev-dependencies]
+proptest = { workspace = true }
+wat = "=1.243.0"
+peak_alloc = "0.2"
+
+[[test]]
+name = "streaming_validator"
+required-features = ["std"]
+
+[[test]]
+name = "streaming_alloc"
+required-features = ["std"]
+
+[[example]]
+name = "stream_bench"
+required-features = ["std"]

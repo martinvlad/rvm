@@ -68,17 +68,92 @@ impl ParsedSegment {
     }
 }
 
+/// Magic of the 4096-byte Level-0 root manifest page that `rvf-forge-core`
+/// appends to an authored container: the little-endian bytes `30 4D 56 52`,
+/// mnemonic `RVM0` under big-endian rendering. Matches RuVector
+/// `rvf_types::ROOT_MANIFEST_MAGIC`.
+pub const ROOT_PAGE_MAGIC: u32 = 0x5256_4D30;
+
+/// Size of the Level-0 root manifest page in bytes.
+pub const ROOT_PAGE_SIZE: usize = 4096;
+
+/// The result of [`walk_container`]: the segment inventory plus the trailing
+/// Level-0 root page region, when the container has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkedContainer {
+    /// Segments in stream order. The root page is not a segment and is not
+    /// listed here.
+    pub segments: Vec<ParsedSegment>,
+    /// Byte range of the trailing 4096-byte root page (`RVM0`), if present.
+    /// It always ends at `data.len()`.
+    pub root_page: Option<Range<usize>>,
+}
+
+/// Locate a trailing Level-0 root page.
+///
+/// The page is recognised by its `RVM0` magic at exactly `len - 4096`, the only
+/// place the format permits it, and only when at least one segment header's
+/// worth of bytes precedes it. A bare segment stream that merely happens to be
+/// long is therefore still walked whole. Mirrors `rvf-forge-core`
+/// `container::split_root_manifest`.
+fn split_root_page(data: &[u8]) -> (&[u8], Option<Range<usize>>) {
+    if data.len() < ROOT_PAGE_SIZE + SEGMENT_HEADER_SIZE {
+        return (data, None);
+    }
+    let start = data.len() - ROOT_PAGE_SIZE;
+    let magic = u32::from_le_bytes([
+        data[start],
+        data[start + 1],
+        data[start + 2],
+        data[start + 3],
+    ]);
+    if magic == ROOT_PAGE_MAGIC {
+        (&data[..start], Some(start..data.len()))
+    } else {
+        (data, None)
+    }
+}
+
+/// Walk `data`, recognising an optional trailing Level-0 root page.
+///
+/// The root page is reported in [`WalkedContainer::root_page`] instead of being
+/// misread as a segment header. The page is **not authenticated by this
+/// function**; its bytes are covered by the container identity hash only.
+///
+/// # Errors
+///
+/// As [`walk`].
+pub fn walk_container(data: &[u8]) -> RvfResult<WalkedContainer> {
+    let (body, root_page) = split_root_page(data);
+    let segments = walk_segments(body)?;
+    Ok(WalkedContainer {
+        segments,
+        root_page,
+    })
+}
+
 /// Walk `data` and return every segment in stream order.
 ///
-/// The rejection set mirrors the RuVector reader exactly: bad magic,
-/// truncated streams, payload lengths past the end, inconsistent footers, and
-/// a `SIGNED` flag with no signature behind it.
+/// A trailing Level-0 root page, if present, is skipped (see
+/// [`walk_container`] to learn where it was). Containers without a root page
+/// are walked exactly as before.
+///
+/// The rejection set mirrors the RuVector reader: bad magic, truncated
+/// streams, payload lengths past the end, inconsistent footers, and a
+/// `SIGNED` flag with no signature behind it. Files written by the legacy
+/// `rvf-runtime` `RvfStore` dialect (unpadded segments) are rejected; see
+/// RuVector ADR-354 and `tests/fixtures/README.md`.
 ///
 /// # Errors
 ///
 /// One of the [`RvfError`] variants describing which structural rule the
 /// container broke.
 pub fn walk(data: &[u8]) -> RvfResult<Vec<ParsedSegment>> {
+    walk_container(data).map(|w| w.segments)
+}
+
+/// Walk a segment area that has already had any root page trimmed.
+fn walk_segments(data: &[u8]) -> RvfResult<Vec<ParsedSegment>> {
     if data.len() < SEGMENT_HEADER_SIZE {
         return Err(RvfError::Truncated);
     }
