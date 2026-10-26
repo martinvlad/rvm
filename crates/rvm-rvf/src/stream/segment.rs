@@ -1,6 +1,6 @@
 //! Incremental per-segment checks on released chunks.
 //!
-//! [`crate::verify`] checks a segment's content hash, signature footer and
+//! [`crate::verify()`] checks a segment's content hash, signature footer and
 //! structure from a buffer it holds whole. A stream cannot hold a large
 //! segment whole, and must not (that is the memory bound), so
 //! [`SegmentChecker`] computes the same facts while the segment's chunks go
@@ -28,7 +28,7 @@ const MAX_FOOTER: usize = 8 + MAX_SIGNATURE_LENGTH as usize;
 /// Why a segment could not be accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SegmentFault {
-    /// The bytes are not a well-formed segment ([`crate::verify`] would
+    /// The bytes are not a well-formed segment ([`crate::verify()`] would
     /// return this [`RvfError`]).
     Malformed(RvfError),
     /// The segment header disagrees with the signed table entry.

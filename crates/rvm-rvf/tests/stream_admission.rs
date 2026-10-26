@@ -201,3 +201,34 @@ fn a_package_without_the_declaration_is_unchanged_by_the_downgrade_rule() {
         .iter()
         .all(|r| r.check != CheckKind::StreamProfile));
 }
+
+#[test]
+fn the_stream_size_prefilter_is_stricter_than_verify_at_a_class_boundary() {
+    // Model payloads total exactly the budget: verify (payload bytes) accepts,
+    // the stream's descriptor prefilter (stored bytes, which include headers
+    // and padding) refuses before any body byte is accepted. The ADR-160
+    // amendment records this; it is the safe direction.
+    let body = common::good_body();
+    let payload_sum: u64 = rvm_rvf::walk(&body)
+        .unwrap()
+        .iter()
+        .filter(|s| matches!(s.header.seg_type, 0x01 | 0x02 | 0x06))
+        .map(|s| s.header.payload_length)
+        .sum();
+    let mut o = opts();
+    o.size_policy = rvm_rvf::SizePolicy::permissive().with_max_model_bytes(payload_sum);
+    assert!(verify(&body, &o).unwrap().ok);
+
+    let b = builder(12, Order::File);
+    let bundle = b.build(&body).unwrap();
+    let keys = [b.public_key()];
+    let run = run_bundle(&bundle, &keys, &o);
+    assert_eq!(
+        run.state,
+        StreamState::Rejected(rvm_rvf::stream::StreamError::LimitExceeded)
+    );
+    assert!(run.report.is_none());
+    // With a little headroom both accept and the reports are equal.
+    o.size_policy = rvm_rvf::SizePolicy::permissive().with_max_model_bytes(payload_sum + 1024);
+    assert_same("good-with-headroom", &body, &o, 12, Order::File);
+}

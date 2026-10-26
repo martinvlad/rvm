@@ -15,7 +15,7 @@
 //! | [`decode_descriptor`] | parse and authenticate the descriptor (only parser of unauthenticated bytes) |
 //! | [`StreamVerifier`] | the receiver state machine, push-style, one frame at a time |
 //! | [`FrameReader`] | reassemble frames from arbitrary byte splits, size-checked before buffering |
-//! | [`SegmentChecker`] / [`StreamAdmission`] | the ADR-155 loading rules, applied incrementally to released bytes |
+//! | `SegmentChecker` / [`StreamAdmission`] | the ADR-155 loading rules, applied incrementally to released bytes |
 //! | [`witness`] | one witness record per descriptor, segment and poison event |
 //!
 //! ## Allocation
@@ -96,7 +96,7 @@ pub struct StreamPolicy<'a> {
     pub max_open_segments: usize,
     /// Signed class totals and container cap (ADR-155 section 4). Class totals
     /// are checked against each segment's `stored_len`, which is at least its
-    /// payload length, so this prefilter is never looser than [`crate::verify`].
+    /// payload length, so this prefilter is never looser than [`crate::verify()`].
     pub size: SizePolicy,
     /// Trusted Ed25519 public keys, matched by `signer_key_id`.
     pub trusted_keys: &'a [[u8; 32]],

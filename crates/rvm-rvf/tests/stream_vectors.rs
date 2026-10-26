@@ -344,3 +344,36 @@ fn every_negative_case_is_refused_as_listed() {
         run_case(&v, c);
     }
 }
+
+/// Writes the fuzz seed corpus. Run with
+/// `FUZZ_SEED_DIR=crates/rvm-rvf/fuzz/corpus cargo test -p rvm-rvf --test stream_vectors -- --ignored write_fuzz_seeds`.
+#[test]
+#[ignore = "writes files; run by hand to refresh the fuzz corpus"]
+fn write_fuzz_seeds() {
+    let Ok(dir) = std::env::var("FUZZ_SEED_DIR") else {
+        return;
+    };
+    let v = vectors();
+    let desc_dir = format!("{dir}/descriptor_decode");
+    let frame_dir = format!("{dir}/frame_machine");
+    std::fs::create_dir_all(&desc_dir).unwrap();
+    std::fs::create_dir_all(&frame_dir).unwrap();
+    for stream in v["streams"].as_array().unwrap() {
+        let name = stream["name"].as_str().unwrap();
+        // Raw mode (even first byte): the signed descriptor as it is.
+        let mut raw = vec![0u8];
+        raw.extend(hex(stream["descriptor_hex"].as_str().unwrap()));
+        std::fs::write(format!("{desc_dir}/{name}-raw"), raw).unwrap();
+        // Resigned mode (odd first byte): the unsigned part of the descriptor.
+        let d = hex(stream["descriptor_hex"].as_str().unwrap());
+        let mut re = vec![1u8];
+        re.extend_from_slice(&d[..d.len() - 66]);
+        std::fs::write(format!("{desc_dir}/{name}-resigned"), re).unwrap();
+        // The frame stream: budget 4, two split bytes, then every frame.
+        let mut f = vec![4u8, 63, 20];
+        for fr in stream["frames"].as_array().unwrap() {
+            f.extend(hex(fr["hex"].as_str().unwrap()));
+        }
+        std::fs::write(format!("{frame_dir}/{name}"), f).unwrap();
+    }
+}

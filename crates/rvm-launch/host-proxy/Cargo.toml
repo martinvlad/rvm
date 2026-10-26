@@ -1,0 +1,22 @@
+[package]
+name = "ofer-host-proxy"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "HOST PROXY benchmark (ADR-160 B5): time from first byte to a verified, validated module plus instantiation in a host WASM engine. Not RVM execution; RVM has no engine."
+
+# Deliberately NOT a member of the RVM workspace: wasmi must never enter the
+# production dependency graph.
+[workspace]
+
+[dependencies]
+rvm-launch = { path = ".." }
+rvm-rvf = { path = "../../rvm-rvf", features = ["testkit"] }
+rvm-wasm = { path = "../../rvm-wasm", features = ["alloc"] }
+wasmi = "2"
+wat = "=1.243.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

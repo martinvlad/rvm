@@ -45,6 +45,7 @@ use crate::error::LaunchResult;
 use crate::instance::Instance;
 use crate::state::InstanceState;
 use crate::stream_module::VerifiedModule;
+use crate::stream_session_types::{PoisonReport, SessionError, SessionEvent, SessionState};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use rvm_cap::CapabilityManager;
@@ -60,94 +61,6 @@ use rvm_witness::WitnessLog;
 
 /// The `seg_type` of a WASM runtime segment.
 const SEG_TYPE_WASM: u8 = rvm_rvf::format::SEG_TYPE_WASM;
-
-/// Where the session stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionState {
-    /// Frames are being accepted.
-    Receiving,
-    /// Every segment verified and the package passed ADR-155 admission.
-    Complete,
-    /// The stream completed but the package or a module was refused.
-    Failed,
-    /// The stream is poisoned. Terminal.
-    Poisoned,
-}
-
-/// Why the session refused something.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionError {
-    /// The stream or admission layer refused a frame.
-    Stream(AdmissionError),
-    /// A streamed module failed validation or exceeded policy.
-    Module {
-        /// The segment that carried it.
-        seg_id: u64,
-        /// What the validator said.
-        error: ModuleError,
-    },
-    /// The stream completed but the package did not pass ADR-155 admission.
-    PackageRefused,
-    /// A module was requested before the stream completed.
-    NotComplete,
-    /// No validated module exists for that segment.
-    NoSuchModule,
-    /// The buffered bytes do not match the verified executable identity.
-    IdentityMismatch,
-    /// The session failed or was poisoned earlier.
-    Unusable,
-}
-
-impl core::fmt::Display for SessionError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Stream(e) => write!(f, "{e}"),
-            Self::Module { seg_id, error } => write!(f, "module in segment {seg_id}: {error}"),
-            Self::PackageRefused => f.write_str("the package did not pass admission"),
-            Self::NotComplete => f.write_str("the stream is not complete"),
-            Self::NoSuchModule => f.write_str("no validated module for that segment"),
-            Self::IdentityMismatch => {
-                f.write_str("module bytes do not match the verified executable identity")
-            }
-            Self::Unusable => f.write_str("the session failed or was poisoned"),
-        }
-    }
-}
-
-impl From<AdmissionError> for SessionError {
-    fn from(e: AdmissionError) -> Self {
-        Self::Stream(e)
-    }
-}
-
-/// What a frame did, in terms a transport driver cares about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionEvent {
-    /// The descriptor was accepted.
-    Descriptor,
-    /// A chunk table was accepted.
-    Table,
-    /// A chunk was released.
-    Chunk {
-        /// Its segment.
-        seg_id: u64,
-        /// This chunk completed the segment.
-        segment_verified: bool,
-        /// This chunk completed the stage.
-        stage_verified: Option<u8>,
-    },
-    /// The last chunk arrived and admission passed.
-    Complete,
-}
-
-/// Why and where a stream was poisoned, for a consumer to act on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PoisonReport {
-    /// The descriptor the stream ran under.
-    pub descriptor_hash: [u8; 32],
-    /// The segment, chunk and reason.
-    pub info: PoisonInfo,
-}
 
 /// Writes a stream event to the caller's witness log.
 type Emit<'a> = Option<&'a dyn Fn(&StreamEvent, &[u8; 32])>;

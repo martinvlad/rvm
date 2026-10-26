@@ -48,3 +48,70 @@ It does not boot the bare-metal kernel under QEMU (no `aarch64-unknown-none` tar
 ## Consequences
 
 Positive: bounded memory, early rejection, one rule set for buffered and streamed admission. Negative: `wasmparser` joins the trusted computing base for admission; mitigated by authenticate-before-parse and by re-validation inside any future engine (never `new_unchecked`).
+
+## Implementation notes and amendments (rvm-rvf stream, rvm-launch session)
+
+Written when the code landed on `feat/ofer-rvm-stream`; where this section and
+the Decision above disagree, this section records what was built and why.
+
+1. **Item 3 ("`verify(&[u8])` becomes a thin wrapper over the stream verifier")
+   is not implemented, and cannot be as written.** `StreamVerifier`
+   authenticates bytes against a signed descriptor; `verify` applies the
+   ADR-155 loading rules (root manifest, signed executables, content hashes,
+   size policy, capability mapping) to a container that, in the legacy case,
+   has no descriptor at all. A body with a valid descriptor but an unsigned
+   executable stream-*completes* and `verify`-rejects. What was built instead:
+   both paths build their `VerificationReport` through one function
+   (`rvm_rvf::report::build_report`), the stream feeding it facts computed
+   incrementally (`StreamAdmission`, `SegmentChecker`) and `verify` feeding it
+   facts read from a buffer. The differential test
+   (`tests/stream_admission.rs`) asserts that for every corpus body, in file
+   order and stage order, at segment and 4 KiB chunk granularity, the streamed
+   report equals `verify(body)` record for record (including a real RuVector
+   forge package), and that malformed containers are refused by both.
+   One intended difference: a stream-profiled package records
+   `StreamProfileSatisfied` where the buffered loader records
+   `StreamProfileDowngrade`. The stream's descriptor prefilter sums
+   `stored_len` per class while `verify` sums `payload_length`, so a stream is
+   never admitted that `verify` would refuse on size, but a package at the very
+   edge of a class budget can be refused by the stream and accepted by `verify`.
+2. **Item 5 timing.** `StreamSession::take_module` yields a `VerifiedModule`
+   only when the stream is `Complete` and admission passed, not as soon as the
+   module's own segment verifies: the capability mapping and the root-manifest
+   rule are package-level facts. Stage ordering therefore bounds memory and
+   gives early rejection, but does not yet let a component start before the
+   rest of the package arrives. Early start of a verified component is future
+   work.
+3. **Item 5 placement.** `StreamSession` and `VerifiedModule` live in
+   `rvm-launch`: the session must name `rvm-rvf`, `rvm-wasm` and `Instance`;
+   `rvm-host` sits below `Instance`. `Instance::start_verified` moves the
+   module into the instance's own storage; start is admission and slot
+   activation only.
+4. **Item 6 revocation.** `Poisoned` revokes through `rvm-cap`'s epoch bump,
+   which is global to the `CapabilityManager`. `CapabilityMapping::install`
+   does not return the handles it creates, so a targeted revoke of one
+   package's capabilities is not reachable; a caller that kept the handles can
+   revoke them itself. Instances started from the stream are terminated by
+   descriptor hash; the session drops its derived state.
+5. **Item 7 declaration.** A stream-profiled package carries a `META` line
+   `rvm.stream_profile=required`. It cannot carry the descriptor hash: the
+   descriptor commits to the body, so a body containing its own descriptor hash
+   would be circular. The binding is the descriptor's `rvf_identity`, which
+   covers the line. `VerifyOptions::permit_buffered_stream_profile` (default
+   off) is the explicit permission; without it `verify` records a failed
+   `CheckKind::StreamProfile`. A package that does not carry the line is
+   unaffected, so a publisher who omits it still downgrades to the buffered
+   path; closing that needs the package contract (ADR-155 section 5) to carry
+   the declaration outside the body, which is not built.
+6. **Behaviour taken from the shared vectors (RuVector ADR-353 clarified).**
+   Identity is checked over released bytes only while chunks arrive in file
+   order; stage-ordered delivery completes with an `Unverifiable` identity and
+   `finish_identity(read_at)` checks a persisted body. The identity check runs
+   before the final chunk is released. A chunk whose `requires_mask` stages are
+   not verified is a counted fault, not a held chunk. `rvf_identity` must be
+   zero when `identity_present` is clear, and cycles between stage requirements
+   are rejected. `checksum_algo` 0 or 1 on an executable or index segment
+   poisons the stream.
+7. **Witness.** Stream events use the existing record path with new
+   `CheckKind` values (`StreamDescriptor`, `StreamSegment`, `StreamPoisoned`,
+   `StreamComplete`, `StreamModule`) and the numeric reason in `aux[6..8]`.

@@ -38,7 +38,7 @@ pub enum IdentityStatus {
     /// `SHA-256` over the released bytes in file order equals `rvf_identity`.
     Verified,
     /// Chunks did not arrive in file order; the consumer may re-read its
-    /// persisted body and call [`StreamVerifier::finish_identity`].
+    /// persisted body and call [`super::StreamVerifier::finish_identity`].
     Unverifiable,
     /// The descriptor carries no identity (`identity_present` clear).
     NotPresent,

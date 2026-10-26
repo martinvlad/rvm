@@ -1,6 +1,6 @@
 //! The one rule set that turns per-segment facts into a [`VerificationReport`].
 //!
-//! [`crate::verify`] reads facts from a buffer it holds whole; the streaming
+//! [`crate::verify()`] reads facts from a buffer it holds whole; the streaming
 //! admission ([`crate::stream::StreamAdmission`]) accumulates the same facts
 //! while released chunks go by. Both then call [`build_report`], so the
 //! buffered and the streamed paths cannot disagree about what a record means,

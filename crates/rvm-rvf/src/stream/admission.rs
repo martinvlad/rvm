@@ -5,7 +5,7 @@
 //! the root manifest, a signed executable, matching content hashes, the size
 //! policy and a capability mapping. [`StreamAdmission`] wraps the verifier,
 //! checks each segment incrementally as its chunks are released, and at
-//! `Complete` builds the very [`VerificationReport`] [`crate::verify`] would
+//! `Complete` builds the very [`VerificationReport`] [`crate::verify()`] would
 //! have produced for the same body, with the same records in the same order.
 //!
 //! Executable and metadata payloads are handed to the consumer chunk by chunk
@@ -34,7 +34,7 @@ use alloc::vec::Vec;
 pub enum AdmissionError {
     /// The frame was refused by the stream verifier.
     Stream(StreamError),
-    /// A released segment is not a well-formed RVF segment; [`crate::verify`]
+    /// A released segment is not a well-formed RVF segment; [`crate::verify()`]
     /// would return this error for the same body. The stream is poisoned.
     Malformed {
         /// The segment.
