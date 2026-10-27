@@ -611,6 +611,8 @@ See [ADR-144](docs/adr/ADR-144-gpu-compute-support.md) for the complete architec
 | ADR-156 | External receipt anchoring into the witness chain |
 | ADR-157 | Capability-governed `ruv://` context namespace |
 | ADR-158 | Durable hosted `ruv://` context service |
+| ADR-159 | Semantic policy broker and Strands integration |
+| ADR-160 | Streaming RVF admission and incremental module validation (project Ofer) |
 
 </details>
 
@@ -947,6 +949,56 @@ revisions.
 See [ADR-155](docs/adr/ADR-155-rvf-execution-contract.md) for the decision
 record and [RVForge Integration Map](docs/RVFORGE-INTEGRATION.md) for the
 crate-by-crate division of responsibility and roadmap.
+
+### Streaming admission (project Ofer)
+
+`rvm-rvf` can admit an RVF **as it arrives**, instead of buffering the whole
+container first. A signed stream descriptor (RuVector
+[ADR-353](https://github.com/ruvnet/RuVector/blob/main/docs/adr/ADR-353-rvf-stream-descriptor.md))
+commits to every byte; each chunk is hash-checked against it before anything
+reads it, and the WASM module is validated incrementally by `rvm-wasm`'s
+`StreamingModuleValidator` (a push parser over `wasmparser`, limits from
+`ModulePolicy`). `Instance::start_verified` is reachable only from a module
+that was fully verified, fully validated and identity-confirmed; see
+[ADR-160](docs/adr/ADR-160-streaming-rvf-admission.md).
+
+Measured on one x86_64 workstation (release builds; full tables, spread and
+method in ADR-160):
+
+| Question | Result |
+|---|---|
+| Peak memory, 256 MiB body | **3.5 MiB** chunked stream (18.9 MiB segment-granular) vs 258.6 MiB for buffered `verify` |
+| Verifier throughput | 1.35 GB/s in file order (every byte hashed twice); about 2.4 GB/s with the opt-in `parallel-identity` feature (std only, off by default) |
+| WASM validation | about 195 MB/s streaming vs 183 MB/s buffered `wasmparser`; a declared-4 GiB size lie allocates under 8 KiB |
+| Time to a startable module (host-engine proxy, *not* RVM execution) | file order 54 ms (33 ms with `parallel-identity`) vs 28.5 ms buffered; stage order 80 ms (61 ms) because the persisted body is re-verified; at 1 Gbit/s 540-591 ms vs 567 ms buffered |
+
+Honest reading: the win is **bounded memory, early rejection of bad bytes and
+resumability**, not speed. Streaming is slower than buffering to a startable
+module on a fast local link and roughly equal at 1 Gbit/s.
+
+What it does **not** do:
+- RVM still has **no WASM execution engine**: "start" means admission and
+  agent-slot activation. The time numbers above come from a host engine run
+  outside RVM and are labelled as a proxy.
+- A component cannot start before the whole stream completes (early component
+  start is designed but not built).
+- Stage-ordered delivery completes as `CompleteUnverified` until
+  `finish_identity` re-verifies the persisted body; `take_module`,
+  `package()` and capability installation refuse until it succeeds.
+- A package that declares `rvm.stream_profile=required` is refused by the
+  buffered loader unless `permit_buffered_stream_profile` is set, which itself
+  requires a pinned identity. Replay protection is **opt-in by construction**:
+  `StreamPolicy::new` requires an explicit `ReplayProtection` choice and a
+  `PinStore`.
+- Bare-metal boot (`aarch64-unknown-none`) and the Rust 1.77 MSRV were not
+  built or run in the reference environment; the new code builds for
+  `thumbv8m.main-none-eabihf`.
+
+The two repositories implement the wire format independently and are held in
+step by shared known-answer vectors
+(`crates/rvm-rvf/tests/vectors/rvsd-v1-vectors.json`). Independent adversarial review (repeated rounds, each re-attacking the
+previous round's fixes) shaped the current rules; open items are listed in
+ADR-160.
 
 ---
 
