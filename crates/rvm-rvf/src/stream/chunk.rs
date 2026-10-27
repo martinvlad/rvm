@@ -8,7 +8,6 @@ use super::events::{Event, IdentityStatus, StreamState, VerifiedChunk};
 use super::verifier::StreamVerifier;
 use crate::container::ROOT_PAGE_MAGIC;
 use crate::format::{is_executable, SEGMENT_MAGIC_BYTES};
-use sha2::Digest;
 use subtle::ConstantTimeEq;
 
 fn rd32(b: &[u8], o: usize) -> u32 {
@@ -52,7 +51,7 @@ impl StreamVerifier<'_> {
         let completes_stream = completes_segment && self.left == 1;
         if let Some(t) = &mut self.identity {
             if t.feasible && t.pos == body_offset {
-                t.hasher.update(bytes);
+                t.update(bytes);
                 t.pos += bytes.len() as u64;
             } else {
                 t.feasible = false;
@@ -197,14 +196,12 @@ impl StreamVerifier<'_> {
         }
         match &self.identity {
             None => Ok(IdentityStatus::NotPresent),
-            Some(t) if t.feasible && t.pos == h.body_len => {
-                let got: [u8; 32] = t.hasher.clone().finalize().into();
-                if bool::from(got.ct_eq(&h.rvf_identity)) {
-                    Ok(IdentityStatus::Verified)
-                } else {
-                    Err(StreamError::IdentityMismatch)
-                }
-            }
+            Some(t) if t.feasible && t.pos == h.body_len => match t.digest() {
+                Some(got) if bool::from(got.ct_eq(&h.rvf_identity)) => Ok(IdentityStatus::Verified),
+                Some(_) => Err(StreamError::IdentityMismatch),
+                // The worker is gone: nothing was skipped, but nothing was proven.
+                None => Ok(IdentityStatus::Unverifiable),
+            },
             Some(_) => Ok(IdentityStatus::Unverifiable),
         }
     }

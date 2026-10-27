@@ -51,6 +51,7 @@ mod descriptor;
 mod error;
 mod events;
 mod frame;
+mod ident;
 mod pin;
 mod segment;
 mod verifier;

@@ -137,6 +137,18 @@ fn stream_once(order: Order, rate: Option<f64>, body: &[u8]) -> Times {
             _ => {}
         }
     }
+    if order == Order::Stage {
+        // Stage order cannot confirm the identity while streaming: re-read the
+        // persisted body (here: the buffer) and re-verify it. Its cost is part
+        // of the time to a startable module.
+        session
+            .finish_identity(|off, buf| {
+                let at = off as usize;
+                buf.copy_from_slice(&body[at..at + buf.len()]);
+                true
+            })
+            .expect("identity confirms");
+    }
     let vm = session.take_module(2).expect("module");
     let module_at = t0.elapsed();
     let (instance, call) = run_in_wasmi(vm.as_bytes(), t0);

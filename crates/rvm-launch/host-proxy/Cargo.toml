@@ -16,6 +16,10 @@ rvm-wasm = { path = "../../rvm-wasm", features = ["alloc"] }
 wasmi = "2"
 wat = "=1.243.0"
 
+[features]
+# Run the identity hash on a worker thread (rvm-rvf/parallel-identity).
+parallel-identity = ["rvm-rvf/parallel-identity"]
+
 [profile.release]
 opt-level = 3
 lto = "fat"

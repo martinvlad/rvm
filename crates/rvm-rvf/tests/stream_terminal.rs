@@ -154,3 +154,63 @@ fn the_memory_pin_store_is_keyed_by_signer_and_advances_only_by_compare_and_set(
     assert_eq!(store.lookup(&a, &file).unwrap().epoch, 7);
     assert_eq!(store.len(), 2);
 }
+
+/// A body big enough (>= 4 MiB, 64 KiB chunks) that the `parallel-identity`
+/// feature runs the identity hash on its worker thread. The verdicts must be
+/// the same as inline: Verified for the truth, a mismatch at the final chunk for
+/// a lie (that chunk not released), and a clone taken mid-stream must carry the
+/// identity state of everything queued so far.
+#[test]
+fn identity_verdicts_do_not_depend_on_where_the_identity_hash_runs() {
+    use rvm_rvf::stream::{Event, IdentityStatus};
+    let mut body = common::good_body();
+    body.extend(rvm_rvf::testkit::unsigned_segment(
+        0x01,
+        &common::noise(5 << 20, 3),
+        50,
+    ));
+    let mut b = builder(16, Order::File);
+    let truth = b.build(&body).unwrap();
+    let keys = [b.public_key()];
+
+    let mut v = StreamVerifier::new(policy(&keys, 0));
+    let half = truth.frames.len() / 2;
+    for f in &truth.frames[..half] {
+        v.push(f).unwrap();
+    }
+    let mut fork = v.clone();
+    for f in &truth.frames[half..] {
+        let ev = v.push(f).unwrap();
+        if let Event::Chunk {
+            complete: Some(st), ..
+        } = ev
+        {
+            assert_eq!(st, IdentityStatus::Verified);
+        }
+        fork.push(f).unwrap();
+    }
+    assert_eq!(v.state(), StreamState::Complete);
+    assert_eq!(
+        fork.state(),
+        StreamState::Complete,
+        "a clone carries the hash so far"
+    );
+
+    b.identity_override = Some([0x42; 32]);
+    let lie = b.build(&body).unwrap();
+    let mut v = StreamVerifier::new(policy(&keys, 0));
+    let n = lie.frames.len();
+    for f in &lie.frames[..n - 1] {
+        v.push(f).unwrap();
+    }
+    let before = v.released_chunks();
+    assert_eq!(
+        v.push(&lie.frames[n - 1]).err(),
+        Some(StreamError::IdentityMismatch)
+    );
+    assert_eq!(
+        v.released_chunks(),
+        before,
+        "the final chunk is not released"
+    );
+}
