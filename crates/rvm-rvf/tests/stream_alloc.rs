@@ -76,7 +76,7 @@ fn header(seg_count: u32, body_len: u64) -> StreamHeader {
 fn sizes_are_rejected_before_anything_proportional_is_allocated() {
     let key = SigningKey::from_bytes(&SEED).verifying_key().to_bytes();
     let keys = [key];
-    let policy = StreamPolicy::new(&keys);
+    let policy = StreamPolicy::unpinned_insecure(&keys);
     let bound = policy.descriptor_alloc_bound();
 
     // 1. Descriptors that lie about sizes, validly signed.
@@ -130,7 +130,7 @@ fn sizes_are_rejected_before_anything_proportional_is_allocated() {
         ),
     ];
     for (name, d, want) in &lies {
-        let mut v = StreamVerifier::new(StreamPolicy::new(&keys));
+        let mut v = StreamVerifier::new(StreamPolicy::unpinned_insecure(&keys));
         let frame = descriptor_frame(d);
         let (r, extra) = extra_peak(|| v.push(&frame).err());
         assert_eq!(r, Some(*want), "{name}");
@@ -152,7 +152,7 @@ fn sizes_are_rejected_before_anything_proportional_is_allocated() {
     };
     let bundle = b.build(&body).unwrap();
     let bkeys = [b.public_key()];
-    let mut v = StreamVerifier::new(StreamPolicy::new(&bkeys));
+    let mut v = StreamVerifier::new(StreamPolicy::unpinned_insecure(&bkeys));
     let mut reader = FrameReader::new();
     reader
         .feed(&mut v, &bundle.frames[0], |_| {})
@@ -166,7 +166,7 @@ fn sizes_are_rejected_before_anything_proportional_is_allocated() {
     assert!(extra < 1024, "a 4 GiB chunk claim cost {extra} bytes");
     assert!(matches!(v.state(), StreamState::Poisoned(_)));
 
-    let mut v = StreamVerifier::new(StreamPolicy::new(&bkeys));
+    let mut v = StreamVerifier::new(StreamPolicy::unpinned_insecure(&bkeys));
     let mut reader = FrameReader::new();
     let mut desc_lie = vec![0u8];
     desc_lie.extend_from_slice(&u32::MAX.to_le_bytes());
@@ -174,7 +174,7 @@ fn sizes_are_rejected_before_anything_proportional_is_allocated() {
     assert_eq!(r.err(), Some(StreamError::FrameSizeLie));
     assert!(extra < 1024, "a 4 GiB descriptor claim cost {extra} bytes");
 
-    let mut v = StreamVerifier::new(StreamPolicy::new(&bkeys));
+    let mut v = StreamVerifier::new(StreamPolicy::unpinned_insecure(&bkeys));
     let mut reader = FrameReader::new();
     reader.feed(&mut v, &bundle.frames[0], |_| {}).unwrap();
     let mut table_lie = vec![2u8];
@@ -197,7 +197,7 @@ fn sizes_are_rejected_before_anything_proportional_is_allocated() {
     drop(big);
     let bkeys = [bb.public_key()];
     let opts = VerifyOptions::with_trusted_keys(vec![kp.public]);
-    let mut p = StreamPolicy::new(&bkeys);
+    let mut p = StreamPolicy::unpinned_insecure(&bkeys);
     p.size = rvm_rvf::SizePolicy::permissive();
     let mut adm = StreamAdmission::new(p, opts);
     let (_, extra) = extra_peak(|| {

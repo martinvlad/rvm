@@ -110,8 +110,8 @@ pub use capability::{
     CAPABILITY_DECLARATION_KEY,
 };
 pub use container::{
-    root_manifest, walk, walk_container, ParsedSegment, WalkedContainer, ROOT_PAGE_MAGIC,
-    ROOT_PAGE_SIZE,
+    is_level0_page, root_manifest, walk, walk_container, ParsedSegment, WalkedContainer,
+    ROOT_PAGE_MAGIC, ROOT_PAGE_SIZE,
 };
 pub use detail::DetailCode;
 pub use error::{RvfError, RvfResult};

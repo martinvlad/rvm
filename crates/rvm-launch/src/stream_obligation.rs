@@ -1,0 +1,95 @@
+//! What a poisoned stream leaves the host to do, as a value it must discharge.
+
+use crate::error::LaunchResult;
+use crate::instance::Instance;
+use crate::state::InstanceState;
+use alloc::vec::Vec;
+use rvm_cap::CapabilityTable;
+use rvm_host::HostAdapter;
+use rvm_wasm::agent::AgentManager;
+use rvm_witness::WitnessLog;
+
+/// The consumer effects of a poisoned stream (ADR-353 section 5), scoped to
+/// what *this session* created:
+///
+/// * the capabilities this session installed (its own `(index, generation)`
+///   handles, revoked one by one; there is no global epoch bump), and
+/// * the instances started from this session (matched by session id, not by
+///   descriptor hash, so another tenant streaming the same package is not
+///   touched).
+///
+/// A session that was poisoned before it authenticated a descriptor issues no
+/// obligation: it granted nothing and started nothing.
+///
+/// Obtain it from [`StreamSession::take_obligation`](crate::StreamSession::take_obligation)
+/// after any error that leaves the session `Poisoned` (a refused frame, a
+/// failed `finish_identity`), and [`discharge`](Self::discharge) it.
+#[must_use = "a poisoned stream's capabilities and instances stay live until the obligation is discharged"]
+#[derive(Debug)]
+pub struct PoisonObligation {
+    pub(crate) session_id: u64,
+    pub(crate) handles: Vec<(u32, u32)>,
+}
+
+/// What discharging an obligation did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Discharged {
+    /// Capabilities revoked.
+    pub revoked: usize,
+    /// Instances terminated.
+    pub terminated: usize,
+}
+
+impl PoisonObligation {
+    /// An obligation for `session_id` covering `handles` that the host
+    /// installed under that session by some path other than
+    /// [`StreamSession::install_capabilities`](crate::StreamSession::install_capabilities)
+    /// (for example a host that installs capabilities in several tables).
+    pub fn for_session(session_id: u64, handles: Vec<(u32, u32)>) -> Self {
+        Self {
+            session_id,
+            handles,
+        }
+    }
+
+    /// The session this obligation belongs to.
+    #[must_use]
+    pub const fn session_id(&self) -> u64 {
+        self.session_id
+    }
+
+    /// Revoke the capabilities the session installed into `caps`, and
+    /// terminate every instance in `instances` that was started from it.
+    ///
+    /// # Errors
+    ///
+    /// The first lifecycle error from a termination. Capabilities are revoked
+    /// first, so a failed termination never leaves them live.
+    pub fn discharge<A: HostAdapter, const C: usize, const M: usize, const N: usize>(
+        self,
+        caps: &mut CapabilityTable<C>,
+        instances: &mut [Instance<A>],
+        agents: &mut AgentManager<M>,
+        log: &WitnessLog<N>,
+        timestamp_ns: u64,
+    ) -> LaunchResult<Discharged> {
+        let revoked = self
+            .handles
+            .iter()
+            .filter(|(index, generation)| caps.remove(*index, *generation).is_ok())
+            .count();
+        let mut terminated = 0;
+        for i in instances.iter_mut() {
+            if i.stream_origin().map(|o| o.session_id) == Some(self.session_id)
+                && i.state() != InstanceState::Terminated
+            {
+                i.terminate(agents, log, timestamp_ns)?;
+                terminated += 1;
+            }
+        }
+        Ok(Discharged {
+            revoked,
+            terminated,
+        })
+    }
+}

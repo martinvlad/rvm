@@ -20,7 +20,7 @@
 //!
 //! # When a module becomes available
 //!
-//! [`StreamSession::take_module`] returns a [`VerifiedModule`] only after the
+//! [`StreamSession::take_module`] returns a [`VerifiedModule`](crate::VerifiedModule) only after the
 //! stream is `Complete` and admission produced a passing report. That is
 //! stricter than ADR-160 item 5 (which only requires the module's own segment
 //! to be verified): the capability mapping and the root-manifest rule are
@@ -28,44 +28,69 @@
 //! stage-ordered stream could release a component earlier; this session does
 //! not, and says so rather than guessing at a partial package.
 //!
+//! # Identity
+//!
+//! Chunks that arrive in stage order cannot be hashed in file order, so the
+//! stream completes with an `Unverifiable` identity. [`take_module`] refuses
+//! such a session ([`SessionError::IdentityUnverified`]) until
+//! [`finish_identity`] has re-read the persisted body and matched it to the
+//! signed `rvf_identity`; the status is readable at [`identity_status`].
+//!
 //! # Poison
 //!
 //! A poisoned stream is terminal ([`SessionState::Poisoned`]). The session
-//! drops every byte it derived from the stream, refuses [`take_module`] and
-//! exposes the three consumer effects ADR-353 section 5 names:
-//! [`revoke_capabilities`] (an `rvm-cap` epoch bump),
-//! [`terminate_instances`] (every instance started from this stream) and the
-//! dropped state itself.
+//! drops every byte it derived from the stream and refuses [`take_module`].
+//! What it granted and started is the host's to undo, and the session says
+//! exactly what: [`take_obligation`] returns a [`PoisonObligation`](crate::PoisonObligation) naming the
+//! capabilities this session installed and the instances it started. There is
+//! no global epoch bump and no selection by descriptor hash: a junk frame on
+//! one link, or a replayed one, can end that session and nothing else.
+//!
+//! # Replay protection
+//!
+//! The session records `(epoch, descriptor_hash)` into the policy's
+//! [`PinStore`](rvm_rvf::stream::PinStore) exactly once, when the stream is
+//! `Complete`, its identity is verified and the package passed admission.
+//!
+//! # Frame buffering
+//!
+//! [`push`](StreamSession::push) takes a whole frame the caller already
+//! buffered. [`feed`](StreamSession::feed) takes arbitrary byte splits and
+//! checks every declared frame size against limits derived from the signed
+//! descriptor before buffering anything, so a hostile size claim costs the
+//! policy bound at most.
 //!
 //! [`take_module`]: StreamSession::take_module
-//! [`revoke_capabilities`]: StreamSession::revoke_capabilities
-//! [`terminate_instances`]: StreamSession::terminate_instances
+//! [`finish_identity`]: StreamSession::finish_identity
+//! [`identity_status`]: StreamSession::identity_status
+//! [`take_obligation`]: StreamSession::take_obligation
 
-use crate::error::LaunchResult;
-use crate::instance::Instance;
-use crate::state::InstanceState;
-use crate::stream_module::VerifiedModule;
 use crate::stream_session_types::{PoisonReport, SessionError, SessionEvent, SessionState};
+use crate::stream_target::Witnessed;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use rvm_cap::CapabilityManager;
-use rvm_host::{HostAdapter, VerifiedPackage};
-use rvm_rvf::stream::witness::{binding_of, emit_event, push_witnessed, StreamEvent};
+use core::sync::atomic::{AtomicU32, Ordering};
+use rvm_host::VerifiedPackage;
+use rvm_rvf::stream::witness::{binding_of, emit_event, push_witnessed_with, StreamEvent};
 use rvm_rvf::stream::{
-    AdmissionError, AdmissionEvent, PoisonInfo, StreamAdmission, StreamPolicy, StreamState,
+    AdmissionError, AdmissionEvent, EpochPin, FrameReader, IdentityStatus, PoisonInfo,
+    ReplayProtection, StreamAdmission, StreamPolicy, StreamState,
 };
 use rvm_rvf::{SizePolicy, VerificationReport, VerifyOptions, WitnessContext};
-use rvm_wasm::agent::AgentManager;
 use rvm_wasm::{ModuleError, ModulePolicy, StreamingModuleValidator};
 use rvm_witness::WitnessLog;
 
 /// The `seg_type` of a WASM runtime segment.
 const SEG_TYPE_WASM: u8 = rvm_rvf::format::SEG_TYPE_WASM;
 
+/// Session ids are handed out from here: unique within the process (for the
+/// first 2^32 sessions), never derived from anything the transport controls.
+static NEXT_SESSION: AtomicU32 = AtomicU32::new(1);
+
 /// Writes a stream event to the caller's witness log.
 type Emit<'a> = Option<&'a dyn Fn(&StreamEvent, &[u8; 32])>;
 
-struct ExecProgress {
+pub(crate) struct ExecProgress {
     validator: StreamingModuleValidator,
     bytes: Vec<u8>,
 }
@@ -76,9 +101,9 @@ struct ExecProgress {
 /// import policy, the largest buffered section); the signed policy supplies
 /// the module size: `max_runtime_bytes`, which may exceed the 1 MiB constant.
 /// A section is never allowed to be larger than the module itself.
-/// [`rvm_wasm::MAX_MODULE_SIZE`] stays the executor backstop at start (ADR-155 section
-/// 4), so a module the policy admits but the backstop refuses is witnessed and
-/// refused there, not here.
+/// [`rvm_wasm::MAX_MODULE_SIZE`] stays the executor backstop at start (ADR-155
+/// section 4), so a module the policy admits but the backstop refuses is
+/// witnessed and refused there, not here.
 #[must_use]
 pub fn module_policy_for(size: &SizePolicy, base: ModulePolicy) -> ModulePolicy {
     let limit = usize::try_from(size.max_runtime_bytes).unwrap_or(usize::MAX);
@@ -91,14 +116,21 @@ pub fn module_policy_for(size: &SizePolicy, base: ModulePolicy) -> ModulePolicy 
 
 /// Stream in, startable module out. See the [module documentation](self).
 pub struct StreamSession<'p> {
-    admission: StreamAdmission<'p>,
-    module_policy: ModulePolicy,
-    exec: BTreeMap<u64, ExecProgress>,
-    ready: BTreeMap<u64, (Vec<u8>, rvm_wasm::ValidatedModule)>,
-    package: Option<VerifiedPackage>,
-    state: SessionState,
-    failure: Option<SessionError>,
-    poison: Option<PoisonReport>,
+    pub(crate) admission: StreamAdmission<'p>,
+    pub(crate) module_policy: ModulePolicy,
+    pub(crate) replay: ReplayProtection<'p>,
+    pub(crate) session_id: u64,
+    pub(crate) reader: FrameReader,
+    pub(crate) exec: BTreeMap<u64, ExecProgress>,
+    pub(crate) ready: BTreeMap<u64, (Vec<u8>, rvm_wasm::ValidatedModule)>,
+    pub(crate) package: Option<VerifiedPackage>,
+    pub(crate) pending_package: Option<VerifiedPackage>,
+    pub(crate) state: SessionState,
+    pub(crate) failure: Option<SessionError>,
+    pub(crate) poison: Option<PoisonReport>,
+    pub(crate) installed: Vec<(u32, u32)>,
+    pub(crate) obligation_issued: bool,
+    pub(crate) pin_recorded: bool,
 }
 
 impl<'p> StreamSession<'p> {
@@ -118,15 +150,28 @@ impl<'p> StreamSession<'p> {
         module_policy: ModulePolicy,
     ) -> Self {
         Self {
+            replay: policy.replay,
             admission: StreamAdmission::new(policy, opts),
             module_policy,
+            session_id: u64::from(NEXT_SESSION.fetch_add(1, Ordering::Relaxed)),
+            reader: FrameReader::new(),
             exec: BTreeMap::new(),
             ready: BTreeMap::new(),
             package: None,
+            pending_package: None,
             state: SessionState::Receiving,
             failure: None,
             poison: None,
+            installed: Vec::new(),
+            obligation_issued: false,
+            pin_recorded: false,
         }
+    }
+
+    /// This session's id: what instances started from it remember.
+    #[must_use]
+    pub const fn session_id(&self) -> u64 {
+        self.session_id
     }
 
     /// The session state.
@@ -147,7 +192,10 @@ impl<'p> StreamSession<'p> {
         self.admission.report()
     }
 
-    /// The verified package, once the stream completed and passed.
+    /// The verified package, once the stream completed, passed admission and
+    /// its identity is verified. An `Unverifiable` stage-ordered completion
+    /// exposes no package until [`Self::finish_identity`] succeeds: nothing is
+    /// derived from an identity the signer merely claimed.
     #[must_use]
     pub const fn package(&self) -> Option<&VerifiedPackage> {
         self.package.as_ref()
@@ -157,6 +205,14 @@ impl<'p> StreamSession<'p> {
     #[must_use]
     pub fn stream_state(&self) -> StreamState {
         self.admission.state()
+    }
+
+    /// Whether the package identity was checked against the body:
+    /// `Some(Verified)` once it was, `Some(Unverifiable)` after a stage-ordered
+    /// completion until [`Self::finish_identity`] succeeds.
+    #[must_use]
+    pub fn identity_status(&self) -> Option<IdentityStatus> {
+        self.admission.verifier().identity_status()
     }
 
     /// The hash of the signed descriptor, once accepted.
@@ -174,7 +230,8 @@ impl<'p> StreamSession<'p> {
         self.poison.as_ref()
     }
 
-    /// Accept one complete frame.
+    /// Accept one complete, already-buffered frame. To bound what is buffered
+    /// before a frame is judged, use [`Self::feed`].
     ///
     /// # Errors
     ///
@@ -188,9 +245,10 @@ impl<'p> StreamSession<'p> {
         self.after(result, None)
     }
 
-    /// [`Self::push`], writing the stream's witness records first: the
-    /// descriptor verdict, each verified segment, module validation, completion
-    /// and poisoning.
+    /// [`Self::push`], writing the stream's witness records: the descriptor
+    /// verdict, each verified segment, each counted fault, module validation,
+    /// completion (only once the package has been admitted), the failing checks
+    /// of a refused package, and poisoning.
     ///
     /// # Errors
     ///
@@ -204,13 +262,60 @@ impl<'p> StreamSession<'p> {
         if self.state != SessionState::Receiving {
             return Err(SessionError::Unusable);
         }
-        let result = push_witnessed(&mut self.admission, frame, log, ctx);
+        let result = push_witnessed_with(&mut self.admission, frame, log, ctx, false);
         self.after(
             result,
             Some(&|ev: &StreamEvent, b: &[u8; 32]| {
                 emit_event(ev, b, log, ctx);
             }),
         )
+    }
+
+    /// Accept bytes in arbitrary splits. Frames are reassembled one at a time
+    /// and each declared size is checked against limits derived from the signed
+    /// descriptor *before* a payload byte is buffered, so a size lie costs at
+    /// most the policy bound. `sink` receives the result of every completed
+    /// frame.
+    ///
+    /// # Errors
+    ///
+    /// The stream can accept no more input, or a header declared an illegal
+    /// size or an unknown frame type (the stream is poisoned).
+    pub fn feed(
+        &mut self,
+        data: &[u8],
+        sink: impl FnMut(Result<SessionEvent, SessionError>),
+    ) -> Result<(), SessionError> {
+        let mut reader = core::mem::take(&mut self.reader);
+        let r = reader.feed(self, data, sink);
+        self.reader = reader;
+        self.check_poisoned();
+        r.map_err(|e| SessionError::Stream(AdmissionError::Stream(e)))
+    }
+
+    /// [`Self::feed`] with the witness records of [`Self::push_witnessed`],
+    /// including the reader-level poison a size lie causes.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::feed`].
+    pub fn feed_witnessed<const N: usize>(
+        &mut self,
+        data: &[u8],
+        log: &WitnessLog<N>,
+        ctx: WitnessContext,
+        sink: impl FnMut(Result<SessionEvent, SessionError>),
+    ) -> Result<(), SessionError> {
+        let mut reader = core::mem::take(&mut self.reader);
+        let mut target = Witnessed {
+            session: self,
+            log,
+            ctx,
+        };
+        let r = reader.feed(&mut target, data, sink);
+        self.reader = reader;
+        self.check_poisoned();
+        r.map_err(|e| SessionError::Stream(AdmissionError::Stream(e)))
     }
 
     fn after(
@@ -228,6 +333,8 @@ impl<'p> StreamSession<'p> {
         let (out, complete) = match ev {
             AdmissionEvent::DescriptorVerified { .. } => (SessionEvent::Descriptor, false),
             AdmissionEvent::TableVerified { .. } => (SessionEvent::Table, false),
+            AdmissionEvent::Duplicate { seg_id, .. } => (SessionEvent::Duplicate { seg_id }, false),
+            AdmissionEvent::DuplicateDescriptor => (SessionEvent::DuplicateDescriptor, false),
             AdmissionEvent::Chunk {
                 chunk,
                 payload,
@@ -255,7 +362,7 @@ impl<'p> StreamSession<'p> {
             }
         };
         if complete {
-            return self.on_complete();
+            return self.on_complete(witness);
         }
         Ok(out)
     }
@@ -294,18 +401,60 @@ impl<'p> StreamSession<'p> {
         Ok(())
     }
 
-    fn on_complete(&mut self) -> Result<SessionEvent, SessionError> {
+    fn on_complete(&mut self, witness: Emit<'_>) -> Result<SessionEvent, SessionError> {
         let package = self
             .admission
             .report()
             .and_then(|r| VerifiedPackage::from_report(r).ok());
-        if let Some(p) = package {
-            self.package = Some(p);
-            self.state = SessionState::Complete;
-            Ok(SessionEvent::Complete)
-        } else {
+        let Some(p) = package else {
+            // The failing checks were written by the witnessed push; the
+            // refusal itself is the session's failure.
             self.fail(SessionError::PackageRefused);
-            Err(SessionError::PackageRefused)
+            return Err(SessionError::PackageRefused);
+        };
+        if let (Some(w), Some(b)) = (witness, binding_of(&self.admission)) {
+            w(&StreamEvent::StreamComplete, &b);
+        }
+        self.pending_package = Some(p);
+        self.state = SessionState::Complete;
+        self.promote();
+        Ok(SessionEvent::Complete)
+    }
+
+    /// Once the identity is verified: expose the package and pin the
+    /// descriptor. A cut, poisoned or refused stream never gets here, so it
+    /// never moves a pin.
+    pub(crate) fn promote(&mut self) {
+        if self.state == SessionState::Complete
+            && self.identity_status() == Some(IdentityStatus::Verified)
+        {
+            if let Some(p) = self.pending_package.take() {
+                self.package = Some(p);
+            }
+            self.maybe_record_pin();
+        }
+    }
+
+    /// Record the descriptor in the pin store, once.
+    fn maybe_record_pin(&mut self) {
+        if self.pin_recorded
+            || self.state != SessionState::Complete
+            || self.identity_status() != Some(IdentityStatus::Verified)
+        {
+            return;
+        }
+        if let ReplayProtection::Store { store, .. } = self.replay {
+            if let Some(d) = self.admission.verifier().descriptor() {
+                store.record(
+                    &d.header.file_id,
+                    EpochPin {
+                        epoch: d.header.epoch,
+                        descriptor_hash: d.descriptor_hash,
+                        signer_key_id: d.header.signer_key_id,
+                    },
+                );
+                self.pin_recorded = true;
+            }
         }
     }
 
@@ -314,10 +463,11 @@ impl<'p> StreamSession<'p> {
         self.exec.clear();
         self.ready.clear();
         self.package = None;
+        self.pending_package = None;
         self.failure = Some(e);
     }
 
-    fn check_poisoned(&mut self) {
+    pub(crate) fn check_poisoned(&mut self) {
         if let StreamState::Poisoned(reason) = self.admission.state() {
             if self.poison.is_none() {
                 let info = self
@@ -330,7 +480,7 @@ impl<'p> StreamSession<'p> {
                         reason,
                     });
                 self.poison = Some(PoisonReport {
-                    descriptor_hash: self.descriptor_hash().unwrap_or([0; 32]),
+                    descriptor_hash: self.descriptor_hash(),
                     info,
                 });
             }
@@ -338,110 +488,8 @@ impl<'p> StreamSession<'p> {
             self.exec.clear();
             self.ready.clear();
             self.package = None;
+            self.pending_package = None;
             self.admission.discard_derived_state();
         }
-    }
-
-    /// Hand over the validated module of segment `seg_id`.
-    ///
-    /// # Errors
-    ///
-    /// [`SessionError::NotComplete`] before the stream completed,
-    /// [`SessionError::Unusable`] after a failure or poison,
-    /// [`SessionError::NoSuchModule`] when that segment carried no validated
-    /// WASM module, and [`SessionError::IdentityMismatch`] if the buffered
-    /// bytes do not match the verified executable (length and SHA-256).
-    pub fn take_module(&mut self, seg_id: u64) -> Result<VerifiedModule, SessionError> {
-        match self.state {
-            SessionState::Receiving => return Err(SessionError::NotComplete),
-            SessionState::Failed | SessionState::Poisoned => return Err(SessionError::Unusable),
-            SessionState::Complete => {}
-        }
-        let report = self.admission.report().ok_or(SessionError::Unusable)?;
-        let executable = *report
-            .executables
-            .iter()
-            .find(|e| e.segment_id == seg_id && e.segment_type == SEG_TYPE_WASM)
-            .ok_or(SessionError::NoSuchModule)?;
-        let rvf_identity = report.rvf_identity;
-        let (bytes, validated) = self
-            .ready
-            .remove(&seg_id)
-            .ok_or(SessionError::NoSuchModule)?;
-        if !executable.matches(&bytes) {
-            return Err(SessionError::IdentityMismatch);
-        }
-        let descriptor_hash = self.descriptor_hash().unwrap_or([0; 32]);
-        Ok(VerifiedModule::new(
-            bytes,
-            executable,
-            validated,
-            rvf_identity,
-            descriptor_hash,
-        ))
-    }
-
-    /// For a stream that completed with an `Unverifiable` identity (chunks
-    /// arrived in stage order): re-read the persisted body in file order and
-    /// check `SHA-256 == rvf_identity`. A mismatch poisons the stream and the
-    /// poison effects apply.
-    ///
-    /// # Errors
-    ///
-    /// [`SessionError::Stream`] with the verifier's refusal.
-    pub fn finish_identity(
-        &mut self,
-        read_at: impl FnMut(u64, &mut [u8]) -> bool,
-    ) -> Result<(), SessionError> {
-        let r = self
-            .admission
-            .finish_identity(read_at)
-            .map_err(|e| SessionError::Stream(AdmissionError::Stream(e)));
-        self.check_poisoned();
-        r
-    }
-
-    /// Poison effect 1: revoke what the stream's package was granted, by
-    /// bumping the `rvm-cap` epoch so every handle issued before it is stale.
-    ///
-    /// Returns `false` (and does nothing) unless the stream is poisoned.
-    ///
-    /// The bump is global to the manager. [`rvm_rvf::CapabilityMapping::install`]
-    /// does not hand back the handles it creates, so a targeted revoke of just
-    /// this package's capabilities is not reachable from here; a caller that
-    /// kept the handles can `revoke` them itself.
-    pub fn revoke_capabilities<const N: usize>(&self, caps: &mut CapabilityManager<N>) -> bool {
-        if self.state != SessionState::Poisoned {
-            return false;
-        }
-        caps.increment_epoch();
-        true
-    }
-
-    /// Poison effect 2: terminate every instance in `instances` that was
-    /// started from this stream and is not already terminated. Returns how
-    /// many were terminated.
-    ///
-    /// # Errors
-    ///
-    /// The first lifecycle error from a termination.
-    pub fn terminate_instances<A: HostAdapter, const M: usize, const N: usize>(
-        &self,
-        instances: &mut [Instance<A>],
-        agents: &mut AgentManager<M>,
-        log: &WitnessLog<N>,
-        timestamp_ns: u64,
-    ) -> LaunchResult<usize> {
-        let Some(origin) = self.poison.as_ref().map(|p| p.descriptor_hash) else {
-            return Ok(0);
-        };
-        let mut n = 0;
-        for i in instances.iter_mut() {
-            if i.stream_origin() == Some(&origin) && i.state() != InstanceState::Terminated {
-                i.terminate(agents, log, timestamp_ns)?;
-                n += 1;
-            }
-        }
-        Ok(n)
     }
 }

@@ -18,6 +18,19 @@
 //! | `SegmentChecker` / [`StreamAdmission`] | the ADR-155 loading rules, applied incrementally to released bytes |
 //! | [`witness`] | one witness record per descriptor, segment and poison event |
 //!
+//! ## Frame ownership
+//!
+//! A frame is hashed in place and then read again by whoever consumes the
+//! released chunk (the segment checker, the metadata copy, a module validator).
+//! Those reads are of the same `&[u8]` the leaf hash covered. In safe Rust a
+//! shared borrow cannot be mutated while it is alive, so the hashed bytes and
+//! the consumed bytes are the same bytes; no concurrent mutator can exist. The
+//! guarantee ends at an FFI or shared-memory boundary: a caller that builds a
+//! slice over memory another agent can write (DMA, a mapped file, a shared
+//! ring) must copy the frame into verifier-owned memory first, because the
+//! slice is then a lie. ADR-353 section 7 ("verify from verifier-owned
+//! memory") is satisfied by that rule, not by an extra copy on the safe path.
+//!
 //! ## Allocation
 //!
 //! Memory is bounded by the verified descriptor and the receiver policy, never
@@ -25,7 +38,7 @@
 //! [`StreamPolicy::max_descriptor_bytes`], plus a signed-message copy of the
 //! same size while it is checked), one small record per segment, and the leaf
 //! list of each segment whose chunk table was accepted but which is not yet
-//! fully verified (at most [`StreamPolicy::max_pending_table_bytes`]). The
+//! fully verified (at most [`StreamPolicy::max_table_bytes`]). The
 //! verifier never buffers a chunk: a released chunk borrows the caller's frame.
 
 #![allow(clippy::many_single_char_names)]
@@ -37,6 +50,7 @@ mod descriptor;
 mod error;
 mod events;
 mod frame;
+mod pin;
 mod segment;
 mod verifier;
 pub mod witness;
@@ -61,6 +75,7 @@ pub use frame::{
     chunk_frame, descriptor_frame, table_frame, FrameReader, FrameTarget, FRAME_CHUNK,
     FRAME_CHUNK_TABLE, FRAME_DESCRIPTOR,
 };
+pub use pin::{MemoryPinStore, PinStore};
 pub use verifier::StreamVerifier;
 
 use crate::policy::SizePolicy;
@@ -68,14 +83,72 @@ use crate::policy::SizePolicy;
 /// Epoch pin lookup by `file_id`.
 pub type EpochPinFn<'a> = dyn Fn(&[u8; 16]) -> Option<EpochPin> + 'a;
 
-/// The highest accepted `(epoch, descriptor hash)` for one `file_id`.
+/// The highest accepted `(epoch, descriptor hash)` for one lineage: a
+/// `file_id` published by one signer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EpochPin {
     /// Highest accepted epoch.
     pub epoch: u64,
-    /// Hash of the descriptor accepted at that epoch, when known. At an equal
-    /// epoch a descriptor with a different hash is a conflict.
-    pub descriptor_hash: Option<[u8; 32]>,
+    /// Hash of the descriptor accepted at that epoch. At an equal epoch a
+    /// descriptor with a different hash is a conflict.
+    pub descriptor_hash: [u8; 32],
+    /// The `signer_key_id` that published it. A pin constrains only
+    /// descriptors from this signer.
+    pub signer_key_id: [u8; 8],
+}
+
+/// Replay protection: what the receiver remembers and what it believes about
+/// the time. There is no default; [`StreamPolicy::new`] makes the caller choose.
+#[derive(Clone, Copy)]
+pub enum ReplayProtection<'a> {
+    /// No epoch pin and no clock: an old descriptor replays, `expires_ns` is
+    /// ignored. **Insecure by construction**; for tests and tools that do not
+    /// admit anything.
+    Unpinned,
+    /// Look pins up through a function; nothing is recorded.
+    Lookup {
+        /// Pin lookup by `file_id`.
+        pin: &'a EpochPinFn<'a>,
+        /// Trusted clock in ns. A descriptor with `expires_ns` set is refused
+        /// when this is `None`.
+        now_ns: Option<u64>,
+    },
+    /// A [`PinStore`]: looked up here, recorded by the session after admission
+    /// (see the protocol in `stream::pin`).
+    Store {
+        /// The store.
+        store: &'a dyn PinStore,
+        /// Trusted clock in ns. A descriptor with `expires_ns` set is refused
+        /// when this is `None`.
+        now_ns: Option<u64>,
+    },
+}
+
+impl ReplayProtection<'_> {
+    /// The pin for `file_id`.
+    #[must_use]
+    pub fn lookup(&self, file_id: &[u8; 16]) -> Option<EpochPin> {
+        match self {
+            Self::Unpinned => None,
+            Self::Lookup { pin, .. } => pin(file_id),
+            Self::Store { store, .. } => store.lookup(file_id),
+        }
+    }
+
+    /// The trusted clock, if any.
+    #[must_use]
+    pub const fn now_ns(&self) -> Option<u64> {
+        match self {
+            Self::Unpinned => None,
+            Self::Lookup { now_ns, .. } | Self::Store { now_ns, .. } => *now_ns,
+        }
+    }
+
+    /// Whether the receiver does any replay or expiry checking.
+    #[must_use]
+    pub const fn is_pinned(&self) -> bool {
+        !matches!(self, Self::Unpinned)
+    }
 }
 
 /// Receiver policy for descriptors and streams.
@@ -89,8 +162,11 @@ pub struct StreamPolicy<'a> {
     pub max_segment_bytes: u64,
     /// Largest declared `uncompressed_len` of one segment (default 4 GiB).
     pub max_uncompressed_len: u64,
-    /// Most bytes of accepted-but-unconsumed chunk-table leaves (default 16 MiB).
-    pub max_pending_table_bytes: u64,
+    /// Most bytes of chunk-table leaves retained at once (default 64 MiB). They
+    /// are kept for the life of the stream so a repeated chunk can be told from
+    /// a forged one; a table that would exceed this is a counted fault
+    /// (`StreamLimitExceeded`).
+    pub max_table_bytes: u64,
     /// Most segments whose first chunk arrived but which are not yet fully
     /// received, as far as admission is concerned (default 256).
     pub max_open_segments: usize,
@@ -100,34 +176,49 @@ pub struct StreamPolicy<'a> {
     pub size: SizePolicy,
     /// Trusted Ed25519 public keys, matched by `signer_key_id`.
     pub trusted_keys: &'a [[u8; 32]],
-    /// Epoch pin lookup by `file_id`.
-    pub epoch_pin: Option<&'a EpochPinFn<'a>>,
-    /// Trusted clock in ns; `expires_ns` is enforced only when set.
-    pub now_ns: Option<u64>,
+    /// Replay and expiry protection.
+    pub replay: ReplayProtection<'a>,
     /// Expected `policy_hash`; enforced only when set.
     pub expected_policy_hash: Option<[u8; 32]>,
     /// Counted faults tolerated before the stream is poisoned (default 4).
     pub fault_budget: u32,
+    /// Most ignored duplicate frames before the stream is poisoned with
+    /// `StreamDuplicateFlood`. `None` means `4 * total chunks + 64`.
+    ///
+    /// An authentic repeat of an already-verified chunk (or of the descriptor)
+    /// is ignored, not a fault: a retransmit storm must not poison a stream.
+    /// Ignored frames cost no state, so this only bounds the work an attacker
+    /// can force.
+    pub max_duplicate_frames: Option<u64>,
 }
 
 impl<'a> StreamPolicy<'a> {
-    /// The fail-closed defaults, trusting `trusted_keys`.
+    /// The fail-closed defaults, trusting `trusted_keys`, with the replay
+    /// protection the caller chose. See [`ReplayProtection`].
     #[must_use]
-    pub const fn new(trusted_keys: &'a [[u8; 32]]) -> Self {
+    pub const fn new(trusted_keys: &'a [[u8; 32]], replay: ReplayProtection<'a>) -> Self {
         Self {
             max_descriptor_bytes: 1 << 20,
             max_segments: 16384,
             max_segment_bytes: 1 << 30,
             max_uncompressed_len: 1 << 32,
-            max_pending_table_bytes: 16 << 20,
+            max_table_bytes: 64 << 20,
             max_open_segments: 256,
             size: SizePolicy::FAIL_CLOSED,
             trusted_keys,
-            epoch_pin: None,
-            now_ns: None,
+            replay,
             expected_policy_hash: None,
             fault_budget: 4,
+            max_duplicate_frames: None,
         }
+    }
+
+    /// [`Self::new`] with **no replay protection and no clock**. A replayed
+    /// old descriptor is accepted and `expires_ns` is ignored. The name is the
+    /// warning: use it in tests and tools, never where a package is admitted.
+    #[must_use]
+    pub const fn unpinned_insecure(trusted_keys: &'a [[u8; 32]]) -> Self {
+        Self::new(trusted_keys, ReplayProtection::Unpinned)
     }
 
     /// Upper bound on bytes allocated while decoding a descriptor: the entry

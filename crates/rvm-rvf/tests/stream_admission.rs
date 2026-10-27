@@ -9,6 +9,7 @@ mod common;
 use common::{builder, corpus, opts, run_bundle};
 use rvm_rvf::stream::builder::{Order, Span};
 use rvm_rvf::stream::StreamState;
+use rvm_rvf::testkit::unsigned_segment;
 use rvm_rvf::{verify, CheckKind, DetailCode, Outcome, VerifyOptions};
 
 const FORGE: &[u8] = include_bytes!("fixtures/forge-signed-root-page.rvf");
@@ -29,10 +30,13 @@ fn assert_same(name: &str, body: &[u8], opts: &VerifyOptions, chunk_log2: u8, or
     let keys = [b.public_key()];
     let run = run_bundle(&bundle, &keys, opts);
     let ctx = format!("{name} chunk_log2={chunk_log2:#x} order={order:?}");
-    assert_eq!(
+    // File order confirms the identity while streaming. Stage order does only
+    // when the stage order happens to coincide with the file order.
+    assert!(
+        run.state == StreamState::Complete
+            || (order == Order::Stage && run.state == StreamState::CompleteUnverified),
+        "{ctx}: {:?} {:?}",
         run.state,
-        StreamState::Complete,
-        "{ctx}: {:?}",
         run.first_error
     );
     let streamed = run.report.expect("report at Complete");
@@ -176,6 +180,7 @@ fn stream_profile_is_refused_by_the_buffered_loader_unless_permitted() {
 
     let mut permitted = opts();
     permitted.permit_buffered_stream_profile = true;
+    let permitted = permitted.expect_identity(rvm_rvf::sha256(&body));
     let report = verify(&body, &permitted).unwrap();
     assert!(report.ok, "{:?}", report.failures());
     let rec = report
@@ -231,4 +236,62 @@ fn the_stream_size_prefilter_is_stricter_than_verify_at_a_class_boundary() {
     // With a little headroom both accept and the reports are equal.
     o.size_policy = rvm_rvf::SizePolicy::permissive().with_max_model_bytes(payload_sum + 1024);
     assert_same("good-with-headroom", &body, &o, 12, Order::File);
+}
+
+#[test]
+fn a_host_that_requires_a_pin_refuses_an_unpinned_buffer() {
+    // RV-08: stripping the unsigned stream-profile line turns a stream-profiled
+    // package into a plain buffer, so a host that expects streamed packages
+    // pins the identity and the buffered loader refuses everything else.
+    let body = common::good_body();
+    let mut o = opts();
+    o.require_pinned_identity = true;
+    let report = verify(&body, &o).unwrap();
+    assert!(!report.ok);
+    let r = report
+        .records
+        .iter()
+        .find(|r| r.check == CheckKind::Identity)
+        .unwrap();
+    assert_eq!(r.detail, DetailCode::IdentityNotPinned);
+
+    let pinned = o.clone().expect_identity(rvm_rvf::sha256(&body));
+    assert!(verify(&body, &pinned).unwrap().ok);
+    // A pin to some other package still fails: the pin is what ties the bytes.
+    let wrong = o.clone().expect_identity([7; 32]);
+    assert!(!verify(&body, &wrong).unwrap().ok);
+
+    // Streamed delivery is authenticated by the descriptor and needs no pin.
+    let b = builder(12, Order::File);
+    let bundle = b.build(&body).unwrap();
+    let run = run_bundle(&bundle, &[b.public_key()], &o);
+    assert!(run.report.unwrap().ok);
+}
+
+#[test]
+fn permission_to_buffer_a_stream_profiled_package_needs_a_pin() {
+    let body = corpus()
+        .into_iter()
+        .find(|(n, _)| *n == "declares-stream-profile")
+        .unwrap()
+        .1;
+    let mut o = opts();
+    o.permit_buffered_stream_profile = true;
+    assert!(!verify(&body, &o).unwrap().ok);
+    let o = o.expect_identity(rvm_rvf::sha256(&body));
+    assert!(verify(&body, &o).unwrap().ok);
+}
+
+#[test]
+fn a_non_utf8_meta_segment_cannot_hide_the_stream_profile_line() {
+    let mut payload =
+        format!("{}=required\n", rvm_rvf::STREAM_PROFILE_DECLARATION_KEY).into_bytes();
+    payload.extend_from_slice(&[0xFF, 0xFE, 0x80]); // not UTF-8
+    let mut body = common::good_body();
+    body.extend(unsigned_segment(0x07, &payload, 9));
+    let report = verify(&body, &opts()).unwrap();
+    assert!(
+        report.first_failure(CheckKind::StreamProfile).is_some(),
+        "the declaration is read as bytes"
+    );
 }

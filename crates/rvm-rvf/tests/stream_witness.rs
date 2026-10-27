@@ -26,7 +26,7 @@ fn a_good_stream_witnesses_the_descriptor_every_segment_and_completion() {
     let b = builder(12, Order::File);
     let bundle = b.build(&good_body()).unwrap();
     let keys = [b.public_key()];
-    let mut adm = StreamAdmission::new(StreamPolicy::new(&keys), opts());
+    let mut adm = StreamAdmission::new(StreamPolicy::unpinned_insecure(&keys), opts());
     let log = WitnessLog::<128>::new();
     for f in &bundle.frames {
         push_witnessed(&mut adm, f, &log, CTX).unwrap();
@@ -60,7 +60,7 @@ fn a_rejected_descriptor_is_witnessed_with_its_reason() {
     let b = builder(12, Order::File);
     let bundle = b.build(&good_body()).unwrap();
     let other = [[9u8; 32]];
-    let mut adm = StreamAdmission::new(StreamPolicy::new(&other), opts());
+    let mut adm = StreamAdmission::new(StreamPolicy::unpinned_insecure(&other), opts());
     let log = WitnessLog::<128>::new();
     let err = push_witnessed(&mut adm, &bundle.frames[0], &log, CTX).unwrap_err();
     assert!(err.to_string().contains("UnknownSigner"), "{err}");
@@ -86,7 +86,7 @@ fn a_poisoned_stream_is_witnessed_with_segment_chunk_and_reason() {
         .unwrap();
     bundle.frames[at][40] ^= 1;
     let keys = [b.public_key()];
-    let mut policy = StreamPolicy::new(&keys);
+    let mut policy = StreamPolicy::unpinned_insecure(&keys);
     policy.fault_budget = 0;
     let mut adm = StreamAdmission::new(policy, opts());
     let log = WitnessLog::<128>::new();

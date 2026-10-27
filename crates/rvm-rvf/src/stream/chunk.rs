@@ -2,9 +2,11 @@
 //! arriving and a [`VerifiedChunk`] being released.
 
 use super::commit::leaf_hash;
+use super::descriptor::SEG_TYPE_ROOT_PAGE;
 use super::error::{StreamError, StreamResult};
 use super::events::{Event, IdentityStatus, StreamState, VerifiedChunk};
 use super::verifier::StreamVerifier;
+use crate::container::ROOT_PAGE_MAGIC;
 use crate::format::{is_executable, SEGMENT_MAGIC_BYTES};
 use sha2::Digest;
 use subtle::ConstantTimeEq;
@@ -33,7 +35,13 @@ impl StreamVerifier<'_> {
         if len as usize != bytes.len() {
             return Err(self.poison_at(StreamError::FrameSizeLie, Some(seg_id), idx));
         }
-        let i = self.admit_chunk(seg_id, idx, bytes)?;
+        let Some(i) = self.desc.as_ref().and_then(|d| d.find(seg_id)) else {
+            return Err(self.fault(StreamError::UnexpectedFrame, Some(seg_id), idx));
+        };
+        if idx < self.segs[i].next {
+            return self.on_duplicate_chunk(i, idx, bytes);
+        }
+        self.admit_chunk(i, seg_id, idx, bytes)?;
         let (h, e) = {
             let d = self.desc.as_ref().expect("descriptor installed");
             (d.header, d.entries[i])
@@ -65,9 +73,6 @@ impl StreamVerifier<'_> {
         s.next += 1;
         if completes_segment {
             s.done = true;
-            if let Some(l) = s.leaves.take() {
-                self.pending_table_bytes -= l.len() as u64;
-            }
             self.left -= 1;
             let st = e.stage as usize;
             self.stage_remaining[st] -= 1;
@@ -79,7 +84,11 @@ impl StreamVerifier<'_> {
         self.released_chunks += 1;
         if let Some(st) = complete {
             self.identity_status = Some(st);
-            self.state = StreamState::Complete;
+            self.state = if st == IdentityStatus::Unverifiable {
+                StreamState::CompleteUnverified
+            } else {
+                StreamState::Complete
+            };
         }
         Ok(Event::Chunk {
             chunk: VerifiedChunk {
@@ -98,10 +107,7 @@ impl StreamVerifier<'_> {
 
     /// Every check on a chunk frame up to and including the leaf hash and the
     /// weak-checksum rule. Returns the segment's entry index.
-    fn admit_chunk(&mut self, seg_id: u64, idx: u32, bytes: &[u8]) -> StreamResult<usize> {
-        let Some(i) = self.desc.as_ref().and_then(|d| d.find(seg_id)) else {
-            return Err(self.fault(StreamError::UnexpectedFrame, Some(seg_id), idx));
-        };
+    fn admit_chunk(&mut self, i: usize, seg_id: u64, idx: u32, bytes: &[u8]) -> StreamResult<()> {
         let (h, e) = {
             let d = self.desc.as_ref().expect("descriptor installed");
             (d.header, d.entries[i])
@@ -142,7 +148,44 @@ impl StreamVerifier<'_> {
                 return Err(self.poison_at(StreamError::WeakChecksum, Some(seg_id), idx));
             }
         }
-        Ok(i)
+        if idx == 0
+            && e.seg_type == SEG_TYPE_ROOT_PAGE
+            && bytes[..4] != ROOT_PAGE_MAGIC.to_le_bytes()
+        {
+            return Err(self.poison_at(StreamError::TableInvalid, Some(seg_id), idx));
+        }
+        Ok(())
+    }
+
+    /// A chunk below the next expected index: idempotent if it hashes to the
+    /// verified leaf (and counted against the duplicate cap), otherwise an
+    /// ordinary hash-mismatch fault.
+    fn on_duplicate_chunk<'a>(
+        &mut self,
+        i: usize,
+        idx: u32,
+        bytes: &[u8],
+    ) -> StreamResult<Event<'a>> {
+        let (h, e) = {
+            let d = self.desc.as_ref().expect("descriptor installed");
+            (d.header, d.entries[i])
+        };
+        let seg_id = e.seg_id;
+        if h.chunk_len(e.stored_len, idx) != Some(bytes.len() as u64) {
+            return Err(self.poison_at(StreamError::FrameSizeLie, Some(seg_id), idx));
+        }
+        let mut want = e.chunk_table_hash;
+        if let Some(l) = &self.segs[i].leaves {
+            want.copy_from_slice(&l[idx as usize * 32..idx as usize * 32 + 32]);
+        }
+        if !bool::from(leaf_hash(&h.file_id, seg_id, idx, bytes).ct_eq(&want)) {
+            return Err(self.fault(StreamError::ChunkHashMismatch, Some(seg_id), idx));
+        }
+        self.count_duplicate(seg_id, idx)?;
+        Ok(Event::Duplicate {
+            seg_id,
+            chunk_index: idx,
+        })
     }
 
     /// The identity verdict for the chunk that would complete the stream.

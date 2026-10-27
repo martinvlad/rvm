@@ -32,9 +32,20 @@ fn every_valid_module_streams_validates_and_starts_under_every_profile() {
         for (chunk_log2, order) in [(0xFF, Order::File), (12, Order::File), (12, Order::Stage)] {
             let b = builder(chunk_log2, order);
             let keys = [b.public_key()];
-            let bundle = b.build(&package_body(&module, "clock", 2)).unwrap();
+            let body = package_body(&module, "clock", 2);
+            let bundle = b.build(&body).unwrap();
             let mut s = stream(&keys, bundle, base_policy());
             run_all(&mut s).unwrap_or_else(|e| panic!("{name}: {e}"));
+            if order == Order::Stage {
+                // Stage order cannot confirm the identity while streaming: no
+                // module and no package until the persisted body is re-read.
+                assert_eq!(
+                    s.session.take_module(2).err(),
+                    Some(SessionError::IdentityUnverified)
+                );
+                assert!(s.session.package().is_none());
+                confirm(&mut s, &body);
+            }
             let ctx = format!("{name} {chunk_log2:#x} {order:?}");
             assert_eq!(s.session.state(), SessionState::Complete, "{ctx}");
             let vm = s
@@ -62,7 +73,9 @@ fn every_valid_module_streams_validates_and_starts_under_every_profile() {
                 .unwrap_or_else(|e| panic!("{ctx}: {e}"));
             assert_eq!(inst.state(), InstanceState::Running, "{ctx}");
             assert_eq!(inst.module_bytes(), Some(module.as_slice()), "{ctx}");
-            assert_eq!(inst.stream_origin(), Some(&s.bundle.descriptor_hash));
+            let origin = inst.stream_origin().unwrap();
+            assert_eq!(origin.descriptor_hash, s.bundle.descriptor_hash);
+            assert_eq!(origin.session_id, s.session.session_id());
         }
     }
 }
@@ -100,7 +113,7 @@ fn every_malformed_module_is_rejected_and_never_starts() {
             let b = builder(chunk_log2, Order::File);
             let keys = [b.public_key()];
             let bundle = b.build(&package_body(&module, "clock", 2)).unwrap();
-            let mut sp = StreamPolicy::new(&keys);
+            let mut sp = StreamPolicy::unpinned_insecure(&keys);
             sp.size = rvm_rvf::SizePolicy::permissive();
             sp.size.max_segments = 4096;
             let mut session = StreamSession::with_module_policy(sp, opts(), policy.clone());
@@ -261,7 +274,7 @@ fn module_validation_is_witnessed_pass_and_fail() {
         let b = builder(12, Order::File);
         let keys = [b.public_key()];
         let bundle = b.build(&package_body(&module, "clock", 2)).unwrap();
-        let mut policy = StreamPolicy::new(&keys);
+        let mut policy = StreamPolicy::unpinned_insecure(&keys);
         policy.size = rvm_rvf::SizePolicy::permissive();
         policy.size.max_segments = 4096;
         let mut session = StreamSession::new(policy, opts(), base_policy());

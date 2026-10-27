@@ -14,9 +14,13 @@ pub enum StreamState {
     Receiving,
     /// Input ended early. Resumable at chunk granularity; never `Complete`.
     Suspended,
-    /// Every segment verified, the byte count matches and the identity check
-    /// did not fail.
+    /// Every segment verified, the byte count matches and the body's SHA-256
+    /// equals the signed `rvf_identity`. Terminal.
     Complete,
+    /// Every segment verified and the byte count matches, but the chunks did not
+    /// arrive in file order, so the identity is not confirmed. Moves to
+    /// `Complete` or `Poisoned` when `finish_identity` runs.
+    CompleteUnverified,
     /// The descriptor was refused. Terminal.
     Rejected(StreamError),
     /// A hash, size or fault-budget failure. Terminal: revoke, terminate,
@@ -28,7 +32,10 @@ impl StreamState {
     /// Whether no further frame can ever be accepted.
     #[must_use]
     pub const fn is_terminal(&self) -> bool {
-        matches!(self, Self::Rejected(_) | Self::Poisoned(_) | Self::Complete)
+        matches!(
+            self,
+            Self::Rejected(_) | Self::Poisoned(_) | Self::Complete | Self::CompleteUnverified
+        )
     }
 }
 
@@ -89,6 +96,17 @@ pub enum Event<'a> {
         /// Segment id.
         seg_id: u64,
     },
+    /// A chunk that hashes to an already-verified leaf was repeated. Nothing
+    /// was released and no fault was counted; the repeat is counted against
+    /// `max_duplicate_frames`.
+    Duplicate {
+        /// Segment id.
+        seg_id: u64,
+        /// Chunk index.
+        chunk_index: u32,
+    },
+    /// The descriptor frame was repeated byte for byte after admission.
+    DuplicateDescriptor,
     /// A chunk was released.
     Chunk {
         /// The released bytes.

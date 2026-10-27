@@ -36,6 +36,14 @@ pub enum Limit {
     Functions,
     /// Memory pages (declared maximum, or 65 536 when none is declared).
     MemoryPages,
+    /// Initial elements of one table (a table is allocated at instantiation).
+    TableElements,
+    /// Entries in the global section.
+    Globals,
+    /// Segments in the data section.
+    DataSegments,
+    /// Segments in the element section.
+    ElementSegments,
 }
 
 /// Kind of an imported item, as seen by an import predicate.
@@ -129,6 +137,14 @@ pub struct ModulePolicy {
     pub max_memory_pages: u64,
     /// Which imports are allowed.
     pub imports: ImportPolicy,
+    /// Most initial elements of any one table, defined or imported.
+    pub max_table_elements: u64,
+    /// Most globals defined.
+    pub max_globals: u32,
+    /// Most data segments.
+    pub max_data_segments: u32,
+    /// Most element segments.
+    pub max_element_segments: u32,
 }
 
 impl Default for ModulePolicy {
@@ -146,6 +162,10 @@ impl Default for ModulePolicy {
             max_functions: 50_000,
             max_memory_pages: 1_024,
             imports: ImportPolicy::DenyAll,
+            max_table_elements: 65_536,
+            max_globals: 10_000,
+            max_data_segments: 10_000,
+            max_element_segments: 10_000,
         }
     }
 }
@@ -166,6 +186,10 @@ impl ModulePolicy {
             max_functions: u32::MAX,
             max_memory_pages: u64::MAX,
             imports: ImportPolicy::AllowAll,
+            max_table_elements: u64::MAX,
+            max_globals: u32::MAX,
+            max_data_segments: u32::MAX,
+            max_element_segments: u32::MAX,
         }
     }
 }

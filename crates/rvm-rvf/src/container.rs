@@ -89,10 +89,43 @@ pub struct WalkedContainer {
     pub root_page: Option<Range<usize>>,
 }
 
+/// CRC32C (Castagnoli) of `data`.
+fn crc32c(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0x82F6_3B78 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
+}
+
+/// Whether `page` is a structurally valid Level-0 root page: exactly 4096
+/// bytes, the `RVM0` magic, version 1, a signature length that fits the
+/// signature buffer, and the CRC32C of bytes `0x000..0xFFC` stored at `0xFFC`.
+///
+/// The magic alone is not enough: any payload can contain four bytes.
+#[must_use]
+pub fn is_level0_page(page: &[u8]) -> bool {
+    if page.len() != ROOT_PAGE_SIZE {
+        return false;
+    }
+    let u16_at = |o: usize| u16::from_le_bytes([page[o], page[o + 1]]);
+    let stored = u32::from_le_bytes([page[0xFFC], page[0xFFD], page[0xFFE], page[0xFFF]]);
+    page[..4] == ROOT_PAGE_MAGIC.to_le_bytes()
+        && u16_at(4) == 1
+        && u16_at(0x96) <= 3688
+        && stored == crc32c(&page[..0xFFC])
+}
+
 /// Locate a trailing Level-0 root page.
 ///
-/// The page is recognised by its `RVM0` magic at exactly `len - 4096`, the only
-/// place the format permits it, and only when at least one segment header's
+/// The page is recognised at exactly `len - 4096`, the only place the format
+/// permits it, and only when it is a structurally valid page
+/// ([`is_level0_page`]: magic, version, CRC32C), so four payload bytes that
+/// happen to spell `RVM0` cannot move the segment boundary. It must also have at
+/// least one segment header's
 /// worth of bytes precedes it. A bare segment stream that merely happens to be
 /// long is therefore still walked whole. Mirrors `rvf-forge-core`
 /// `container::split_root_manifest`.
@@ -101,13 +134,7 @@ fn split_root_page(data: &[u8]) -> (&[u8], Option<Range<usize>>) {
         return (data, None);
     }
     let start = data.len() - ROOT_PAGE_SIZE;
-    let magic = u32::from_le_bytes([
-        data[start],
-        data[start + 1],
-        data[start + 2],
-        data[start + 3],
-    ]);
-    if magic == ROOT_PAGE_MAGIC {
+    if is_level0_page(&data[start..]) {
         (&data[..start], Some(start..data.len()))
     } else {
         (data, None)

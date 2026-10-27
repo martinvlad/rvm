@@ -297,6 +297,7 @@ mod tests {
             CheckKind::StreamPoisoned,
             CheckKind::StreamComplete,
             CheckKind::StreamModule,
+            CheckKind::StreamFault,
         ] {
             assert!(emits_a_record_for(check));
         }

@@ -21,7 +21,7 @@ use super::frame::FrameTarget;
 use super::segment::{SegmentChecker, SegmentFault};
 use super::verifier::StreamVerifier;
 use super::StreamPolicy;
-use crate::container::{ParsedSegment, ROOT_PAGE_MAGIC, ROOT_PAGE_SIZE};
+use crate::container::{is_level0_page, ParsedSegment, ROOT_PAGE_SIZE};
 use crate::error::RvfError;
 use crate::format::SEG_TYPE_META;
 use crate::report::{build_report, Declarations, Delivery, ReportInput, SegmentFacts};
@@ -54,6 +54,20 @@ pub enum AdmissionError {
     /// More segments were open at once than the policy allows. The stream is
     /// poisoned.
     TooManyOpenSegments,
+}
+
+impl AdmissionError {
+    /// The stream-level reason this failure is recorded under.
+    #[must_use]
+    pub const fn reason(&self) -> StreamError {
+        match self {
+            Self::Stream(e) => *e,
+            Self::Malformed { .. } => StreamError::SegmentMalformed,
+            Self::DescriptorMismatch { .. } => StreamError::SegmentMismatch,
+            Self::IdentityRequired => StreamError::IdentityRequired,
+            Self::TooManyOpenSegments => StreamError::TooManyOpenSegments,
+        }
+    }
 }
 
 impl From<StreamError> for AdmissionError {
@@ -93,6 +107,15 @@ pub enum AdmissionEvent<'a> {
         /// Segment id.
         seg_id: u64,
     },
+    /// A repeat of an already-verified chunk or table; ignored.
+    Duplicate {
+        /// Segment id.
+        seg_id: u64,
+        /// Chunk index (0 for a table).
+        chunk_index: u32,
+    },
+    /// The descriptor frame was repeated byte for byte; ignored.
+    DuplicateDescriptor,
     /// A chunk was released.
     Chunk {
         /// The released chunk (the whole stored-segment slice).
@@ -196,6 +219,14 @@ impl<'p> StreamAdmission<'p> {
                 })
             }
             Event::TableVerified { seg_id } => Ok(AdmissionEvent::TableVerified { seg_id }),
+            Event::DuplicateDescriptor => Ok(AdmissionEvent::DuplicateDescriptor),
+            Event::Duplicate {
+                seg_id,
+                chunk_index,
+            } => Ok(AdmissionEvent::Duplicate {
+                seg_id,
+                chunk_index,
+            }),
             Event::Chunk {
                 chunk,
                 segment_verified,
@@ -214,6 +245,11 @@ impl<'p> StreamAdmission<'p> {
         }
     }
 
+    /// Poison the wrapped verifier from outside (a reader-level size lie).
+    pub fn verifier_poison(&mut self, reason: StreamError) -> StreamError {
+        self.verifier.poison(reason)
+    }
+
     /// [`StreamVerifier::finish_identity`] on the wrapped verifier.
     ///
     /// # Errors
@@ -227,9 +263,18 @@ impl<'p> StreamAdmission<'p> {
     }
 
     /// Drop everything derived from released bytes: open segment checkers,
-    /// collected metadata and finished segment facts. Called when a stream is
-    /// poisoned; the verifier itself is already terminal.
+    /// collected metadata and finished segment facts.
+    ///
+    /// A live stream cannot continue without that state, so calling this on
+    /// one poisons it first (`StreamBadState`) instead of leaving a later
+    /// panic. A stream that is already terminal is left as it is.
     pub fn discard_derived_state(&mut self) {
+        if !matches!(
+            self.verifier.state(),
+            StreamState::Poisoned(_) | StreamState::Rejected(_)
+        ) {
+            self.verifier.poison(StreamError::BadState);
+        }
         self.open.clear();
         self.meta.clear();
         self.done.clear();
@@ -237,8 +282,7 @@ impl<'p> StreamAdmission<'p> {
     }
 
     fn fail(&mut self, e: AdmissionError, seg: Option<u64>, chunk: u32) -> AdmissionError {
-        self.verifier
-            .poison_at(StreamError::TableInvalid, seg, chunk);
+        self.verifier.force_poison(e.reason(), seg, chunk);
         self.discard_derived_state();
         self.failure = Some(e);
         e
@@ -270,15 +314,21 @@ impl<'p> StreamAdmission<'p> {
                     chunk.chunk_index,
                 ));
             }
-            let stored = self
+            let entry = self
                 .verifier
                 .descriptor()
                 .expect("descriptor installed")
-                .entries[entry_idx]
-                .stored_len;
+                .entries[entry_idx];
+            let (stored, uncompressed) = (entry.stored_len, entry.uncompressed_len);
             self.open.insert(
                 i,
-                SegmentChecker::new(seg_id, chunk.seg_type, chunk.body_offset, stored),
+                SegmentChecker::new(
+                    seg_id,
+                    chunk.seg_type,
+                    chunk.body_offset,
+                    stored,
+                    uncompressed,
+                ),
             );
         }
         let Some(checker) = self.open.get_mut(&i) else {
@@ -326,9 +376,7 @@ impl<'p> StreamAdmission<'p> {
     ) -> Result<(&'a [u8], u64), AdmissionError> {
         let seg_id = chunk.seg_id;
         let bad = chunk.chunk_index == 0
-            && (chunk.bytes.len() < 4
-                || chunk.bytes[..4] != ROOT_PAGE_MAGIC.to_le_bytes()
-                || self.root_page_len() != ROOT_PAGE_SIZE as u64);
+            && (!is_level0_page(chunk.bytes) || self.root_page_len() != ROOT_PAGE_SIZE as u64);
         if bad {
             return Err(self.fail(
                 AdmissionError::Malformed {

@@ -4,6 +4,19 @@ use alloc::vec::Vec;
 use rvm_rvf::VerifiedExecutable;
 use rvm_wasm::ValidatedModule;
 
+/// Which stream session, under which signed descriptor, produced a module.
+///
+/// The session id is unique within the process: two sessions streaming the
+/// same package (the same descriptor hash) have different ids, so a poisoned
+/// session cannot reach another tenant's instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamOrigin {
+    /// The session that verified the module.
+    pub session_id: u64,
+    /// The hash of the signed descriptor it streamed under.
+    pub descriptor_hash: [u8; 32],
+}
+
 /// A WASM module that has passed every gate on the stream path.
 ///
 /// The only constructor is crate-private and is called by exactly one place,
@@ -35,6 +48,7 @@ pub struct VerifiedModule {
     validated: ValidatedModule,
     rvf_identity: [u8; 32],
     descriptor_hash: [u8; 32],
+    session_id: u64,
 }
 
 impl VerifiedModule {
@@ -44,6 +58,7 @@ impl VerifiedModule {
         validated: ValidatedModule,
         rvf_identity: [u8; 32],
         descriptor_hash: [u8; 32],
+        session_id: u64,
     ) -> Self {
         Self {
             bytes,
@@ -51,15 +66,19 @@ impl VerifiedModule {
             validated,
             rvf_identity,
             descriptor_hash,
+            session_id,
         }
     }
 
-    pub(crate) fn into_bytes(self) -> (Vec<u8>, VerifiedExecutable, [u8; 32], [u8; 32]) {
+    pub(crate) fn into_parts(self) -> (Vec<u8>, VerifiedExecutable, [u8; 32], StreamOrigin) {
         (
             self.bytes,
             self.executable,
             self.rvf_identity,
-            self.descriptor_hash,
+            StreamOrigin {
+                session_id: self.session_id,
+                descriptor_hash: self.descriptor_hash,
+            },
         )
     }
 

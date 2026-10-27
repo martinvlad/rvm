@@ -340,8 +340,12 @@ pub fn decode_descriptor(
         None => return Err(StreamError::UnknownSigner),
     };
 
-    if h.expires_ns != 0 && policy.now_ns.is_some_and(|now| now >= h.expires_ns) {
-        return Err(StreamError::Expired);
+    if h.expires_ns != 0 && policy.replay.is_pinned() {
+        match policy.replay.now_ns() {
+            None => return Err(StreamError::ClockRequired),
+            Some(now) if now >= h.expires_ns => return Err(StreamError::Expired),
+            Some(_) => {}
+        }
     }
     if policy
         .expected_policy_hash
@@ -350,11 +354,18 @@ pub fn decode_descriptor(
         return Err(StreamError::PolicyMismatch);
     }
     let dhash = descriptor_hash(bytes);
-    if let Some(pin) = policy.epoch_pin.and_then(|lookup| lookup(&h.file_id)) {
+    // A pin binds a lineage: the file id *and* the signer that published it.
+    // A descriptor from another signer is not that lineage and is judged by
+    // the trust set alone.
+    if let Some(pin) = policy
+        .replay
+        .lookup(&h.file_id)
+        .filter(|p| p.signer_key_id == h.signer_key_id)
+    {
         if h.epoch < pin.epoch {
             return Err(StreamError::StaleEpoch);
         }
-        if h.epoch == pin.epoch && pin.descriptor_hash.is_some_and(|x| x != dhash) {
+        if h.epoch == pin.epoch && pin.descriptor_hash != dhash {
             return Err(StreamError::EpochConflict);
         }
     }
@@ -388,8 +399,14 @@ fn parse_table(table: &[u8], h: &StreamHeader, policy: &StreamPolicy<'_>) -> Str
         if e.body_offset != expect_off || e.stored_len == 0 {
             return Err(Invalid);
         }
+        if e.flags != 0 {
+            return Err(Invalid);
+        }
         if e.seg_type == SEG_TYPE_ROOT_PAGE {
-            if i + 1 != h.seg_count as usize {
+            if i + 1 != h.seg_count as usize
+                || e.stored_len != crate::container::ROOT_PAGE_SIZE as u64
+                || e.uncompressed_len != 0
+            {
                 return Err(Invalid);
             }
         } else if e.stored_len < 64 {
@@ -409,7 +426,7 @@ fn parse_table(table: &[u8], h: &StreamHeader, policy: &StreamPolicy<'_>) -> Str
         let Some(n) = h.chunk_count(e.stored_len) else {
             return Err(Limit);
         };
-        if u64::from(n) > 1 && u64::from(n) * 32 > policy.max_pending_table_bytes {
+        if u64::from(n) > 1 && u64::from(n) * 32 > policy.max_table_bytes {
             return Err(Limit);
         }
         let class = segment_class(e.seg_type);

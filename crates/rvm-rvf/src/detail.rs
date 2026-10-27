@@ -54,6 +54,8 @@ pub enum DetailCode {
     StreamProfilePermitted,
     /// The package declares a stream profile and arrived as a verified stream.
     StreamProfileSatisfied,
+    /// The host requires a pinned identity and none was supplied.
+    IdentityNotPinned,
     /// A stream descriptor passed every ADR-353 invariant.
     StreamDescriptorAccepted,
     /// Every chunk of a stream segment matched its signed commitment.
@@ -109,6 +111,7 @@ impl fmt::Display for DetailCode {
                 "buffered loading of a stream-profiled package permitted"
             }
             Self::StreamProfileSatisfied => "stream-profiled package arrived as a verified stream",
+            Self::IdentityNotPinned => "policy requires a pinned identity and none was supplied",
             Self::StreamDescriptorAccepted => "stream descriptor passed every invariant",
             Self::StreamSegmentAccepted => "every chunk of the segment matched its commitment",
             Self::StreamCompleted => "stream completed",

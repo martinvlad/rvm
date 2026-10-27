@@ -37,6 +37,11 @@ pub enum SessionError {
     NoSuchModule,
     /// The buffered bytes do not match the verified executable identity.
     IdentityMismatch,
+    /// The stream completed with an identity that nothing has verified
+    /// (stage-ordered delivery): call `finish_identity` first.
+    IdentityUnverified,
+    /// Installing the package's capabilities failed.
+    Install(rvm_rvf::RvfError),
     /// The session failed or was poisoned earlier.
     Unusable,
 }
@@ -52,6 +57,10 @@ impl core::fmt::Display for SessionError {
             Self::IdentityMismatch => {
                 f.write_str("module bytes do not match the verified executable identity")
             }
+            Self::IdentityUnverified => {
+                f.write_str("the package identity has not been verified; call finish_identity")
+            }
+            Self::Install(e) => write!(f, "installing capabilities: {e}"),
             Self::Unusable => f.write_str("the session failed or was poisoned"),
         }
     }
@@ -70,6 +79,13 @@ pub enum SessionEvent {
     Descriptor,
     /// A chunk table was accepted.
     Table,
+    /// The descriptor was repeated byte for byte and ignored.
+    DuplicateDescriptor,
+    /// A repeat of an already-verified chunk was ignored.
+    Duplicate {
+        /// Its segment.
+        seg_id: u64,
+    },
     /// A chunk was released.
     Chunk {
         /// Its segment.
@@ -86,8 +102,18 @@ pub enum SessionEvent {
 /// Why and where a stream was poisoned, for a consumer to act on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoisonReport {
-    /// The descriptor the stream ran under.
-    pub descriptor_hash: [u8; 32],
+    /// The descriptor the stream ran under. `None` when the poison happened
+    /// before any descriptor was authenticated: such a stream granted nothing
+    /// and started nothing, and nothing outside the session is affected.
+    pub descriptor_hash: Option<[u8; 32]>,
     /// The segment, chunk and reason.
     pub info: PoisonInfo,
+}
+
+impl PoisonReport {
+    /// Whether the stream had authenticated its descriptor.
+    #[must_use]
+    pub const fn authenticated(&self) -> bool {
+        self.descriptor_hash.is_some()
+    }
 }

@@ -49,7 +49,7 @@ fn fixture(body: Vec<u8>, chunk_log2: u8) -> Fixture {
 }
 
 fn policy(keys: &[[u8; 32]], budget: u32) -> StreamPolicy<'_> {
-    let mut p = StreamPolicy::new(keys);
+    let mut p = StreamPolicy::unpinned_insecure(keys);
     p.fault_budget = budget;
     p
 }
@@ -334,7 +334,8 @@ fn p5_replay_of_an_older_or_conflicting_descriptor() {
 
     let pin = EpochPin {
         epoch: 5,
-        descriptor_hash: Some(accepted.descriptor_hash),
+        descriptor_hash: accepted.descriptor_hash,
+        signer_key_id: accepted.header.signer_key_id,
     };
     let lookup = move |_: &[u8; 16]| Some(pin);
     for (bundle, want) in [
@@ -342,8 +343,11 @@ fn p5_replay_of_an_older_or_conflicting_descriptor() {
         (&other, Some(StreamError::EpochConflict)),
         (&accepted, None),
     ] {
-        let mut p = StreamPolicy::new(&keys);
-        p.epoch_pin = Some(&lookup);
+        let mut p = StreamPolicy::unpinned_insecure(&keys);
+        p.replay = rvm_rvf::stream::ReplayProtection::Lookup {
+            pin: &lookup,
+            now_ns: None,
+        };
         let mut v = StreamVerifier::new(p);
         let r = v.push(&bundle.frames[0]);
         assert_eq!(r.err(), want);

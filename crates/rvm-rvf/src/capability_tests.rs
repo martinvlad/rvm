@@ -150,3 +150,35 @@ fn a_denied_class_installs_nothing() {
     );
     assert!(table.is_empty());
 }
+
+#[test]
+fn install_tracked_returns_the_handles_and_unwinds_a_failed_install() {
+    use rvm_cap::CapabilityTable;
+    use rvm_types::PartitionId;
+    let mapping = map_declared(&[CapabilityClass::Memory, CapabilityClass::Clock]).unwrap();
+
+    let mut table = CapabilityTable::<8>::new();
+    let handles = mapping
+        .install_tracked(&mut table, PartitionId::new(1), 0, 10)
+        .unwrap();
+    assert_eq!(handles.len(), 2);
+    assert_eq!(table.len(), 2);
+    for (index, generation) in &handles {
+        assert!(table.lookup(*index, *generation).is_ok());
+    }
+    for (index, generation) in handles {
+        table.remove(index, generation).unwrap();
+    }
+    assert!(table.is_empty());
+
+    // A table with room for one: the partial install is removed again.
+    let mut tight = CapabilityTable::<1>::new();
+    assert_eq!(
+        mapping.install_tracked(&mut tight, PartitionId::new(1), 0, 10),
+        Err(crate::RvfError::CapabilityTableFull)
+    );
+    assert!(
+        tight.is_empty(),
+        "a failed install leaves the table as it was"
+    );
+}

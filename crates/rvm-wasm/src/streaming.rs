@@ -202,6 +202,13 @@ impl Core {
         }
     }
 
+    fn check_table(&self, initial: u64) -> Result<(), ModuleError> {
+        if initial > self.policy.max_table_elements {
+            return Err(ModuleError::LimitExceeded(Limit::TableElements));
+        }
+        Ok(())
+    }
+
     fn check_memory(&self, m: &MemoryType) -> Result<(), ModuleError> {
         let effective = match m.maximum {
             Some(max) => max,
@@ -214,16 +221,8 @@ impl Core {
         Ok(())
     }
 
-    /// Returns `true` when the module has ended.
-    fn handle(&mut self, payload: &Payload<'_>) -> Result<bool, ModuleError> {
-        // Section size is enforced on the parsed section, so the verdict does
-        // not depend on how the bytes were split. (Code is bounded per body.)
-        if let Some((id, range)) = payload.as_section() {
-            if id != 10 && range.len() > self.policy.max_section_bytes {
-                return Err(ModuleError::LimitExceeded(Limit::SectionBytes));
-            }
-        }
-        // Cheap count limits first, before wasmparser walks the section.
+    /// Cheap count limits first, before wasmparser walks the section.
+    fn precheck(&mut self, payload: &Payload<'_>) -> Result<(), ModuleError> {
         match payload {
             Payload::Version { encoding, .. } if *encoding != Encoding::Module => {
                 return Err(ModuleError::NotACoreModule);
@@ -235,6 +234,29 @@ impl Core {
             Payload::ImportSection(s) => {
                 self.imports = s.count();
                 Self::over(self.imports, self.policy.max_imports, Limit::Imports)?;
+            }
+            Payload::GlobalSection(s) => {
+                Self::over(s.count(), self.policy.max_globals, Limit::Globals)?;
+            }
+            Payload::DataSection(s) => {
+                Self::over(
+                    s.count(),
+                    self.policy.max_data_segments,
+                    Limit::DataSegments,
+                )?;
+            }
+            Payload::ElementSection(s) => {
+                Self::over(
+                    s.count(),
+                    self.policy.max_element_segments,
+                    Limit::ElementSegments,
+                )?;
+            }
+            Payload::TableSection(s) => {
+                for t in s.clone() {
+                    let t = t.map_err(|e| conv(&e))?;
+                    self.check_table(t.ty.initial)?;
+                }
             }
             Payload::ExportSection(s) => {
                 self.exports = s.count();
@@ -263,6 +285,20 @@ impl Core {
             _ => {}
         }
 
+        Ok(())
+    }
+
+    /// Returns `true` when the module has ended.
+    fn handle(&mut self, payload: &Payload<'_>) -> Result<bool, ModuleError> {
+        // Section size is enforced on the parsed section, so the verdict does
+        // not depend on how the bytes were split. (Code is bounded per body.)
+        if let Some((id, range)) = payload.as_section() {
+            if id != 10 && range.len() > self.policy.max_section_bytes {
+                return Err(ModuleError::LimitExceeded(Limit::SectionBytes));
+            }
+        }
+        self.precheck(payload)?;
+
         match self.validator.payload(payload).map_err(|e| conv(&e))? {
             ValidPayload::Func(func, body) => {
                 let mut v = func.into_validator(self.allocs.take().unwrap_or_default());
@@ -282,7 +318,10 @@ impl Core {
                     let imp = imp.map_err(|e| conv(&e))?;
                     let kind = match &imp.ty {
                         TypeRef::Func(_) | TypeRef::FuncExact(_) => ImportKind::Func,
-                        TypeRef::Table(_) => ImportKind::Table,
+                        TypeRef::Table(t) => {
+                            self.check_table(t.initial)?;
+                            ImportKind::Table
+                        }
                         TypeRef::Memory(m) => {
                             self.check_memory(m)?;
                             ImportKind::Memory
