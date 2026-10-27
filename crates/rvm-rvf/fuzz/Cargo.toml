@@ -9,7 +9,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-rvm-rvf = { path = ".." }
+rvm-rvf = { path = "..", features = ["testkit", "std"] }
+rvm-launch = { path = "../../rvm-launch", features = ["std"] }
+rvm-wasm = { path = "../../rvm-wasm", features = ["std"] }
 ed25519-dalek = { version = "=2.1.1", default-features = false }
 serde_json = "1"
 
@@ -25,5 +27,11 @@ doc = false
 [[bin]]
 name = "frame_machine"
 path = "fuzz_targets/frame_machine.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "admission_session"
+path = "fuzz_targets/admission_session.rs"
 test = false
 doc = false
