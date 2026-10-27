@@ -1,3 +1,3 @@
-source: ruvnet/RuVector branch feat/ofer-core, head 05bc191af
+source: ruvnet/RuVector branch feat/ofer-runtime, head 82d5ba746
 path:   crates/rvf/tests/vectors/rvsd-v1-vectors.json (+ README.md, forge_signed_rvm0.rvf, runtime_signed_wire.rvf, runtime_wire_dialect.rvf)
-sha256: e442f865dc06b48a04337f45907c434e0e72644b76ee83c9580ac4837f78bb33
+sha256: 9d331d28dd370da5f65102abf512d0f85a7e9feb78bb44c477c19f90a36309fe

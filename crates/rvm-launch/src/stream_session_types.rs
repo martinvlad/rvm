@@ -85,6 +85,12 @@ pub enum SessionEvent {
     Table,
     /// The descriptor was repeated byte for byte and ignored.
     DuplicateDescriptor,
+    /// A late chunk of a finished multi-chunk segment could not be checked
+    /// (its table was freed) and was ignored.
+    Unverified {
+        /// Its segment.
+        seg_id: u64,
+    },
     /// A repeat of an already-verified chunk was ignored.
     Duplicate {
         /// Its segment.

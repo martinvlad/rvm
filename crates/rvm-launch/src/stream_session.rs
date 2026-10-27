@@ -334,6 +334,9 @@ impl<'p> StreamSession<'p> {
             AdmissionEvent::DescriptorVerified { .. } => (SessionEvent::Descriptor, false),
             AdmissionEvent::TableVerified { .. } => (SessionEvent::Table, false),
             AdmissionEvent::Duplicate { seg_id, .. } => (SessionEvent::Duplicate { seg_id }, false),
+            AdmissionEvent::Unverified { seg_id, .. } => {
+                (SessionEvent::Unverified { seg_id }, false)
+            }
             AdmissionEvent::DuplicateDescriptor => (SessionEvent::DuplicateDescriptor, false),
             AdmissionEvent::Chunk {
                 chunk,

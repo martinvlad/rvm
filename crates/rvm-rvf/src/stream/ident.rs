@@ -38,12 +38,12 @@ mod worker {
     }
 
     impl Worker {
-        pub(super) fn spawn() -> Option<Self> {
+        pub(super) fn spawn(initial: Sha256) -> Option<Self> {
             let (tx, rx): (SyncSender<Msg>, Receiver<Msg>) = sync_channel(QUEUE);
             let handle = std::thread::Builder::new()
                 .name("rvm-rvf-identity".into())
                 .spawn(move || {
-                    let mut h = Sha256::new();
+                    let mut h = initial;
                     for m in rx {
                         match m {
                             Msg::Data(v) => h.update(&v),
@@ -96,17 +96,21 @@ pub(super) struct IdentityTracker {
 
 impl IdentityTracker {
     /// A tracker for a body of `body_len` bytes delivered in chunks of at most
-    /// `max_chunk` bytes.
-    pub(super) fn new(body_len: u64, max_chunk: u64) -> Self {
+    /// `max_chunk` bytes. `in_order_expected` is false when the descriptor's
+    /// stage plan implies out-of-order delivery (the running hash would become
+    /// infeasible at once, so no worker is started for it).
+    pub(super) fn new(body_len: u64, max_chunk: u64, in_order_expected: bool) -> Self {
         #[cfg(not(feature = "parallel-identity"))]
-        let _ = (body_len, max_chunk);
+        let _ = (body_len, max_chunk, in_order_expected);
         Self {
             hasher: Sha256::new(),
             pos: 0,
             feasible: true,
             #[cfg(feature = "parallel-identity")]
-            worker: (body_len >= worker::MIN_BODY && max_chunk <= worker::MAX_CHUNK as u64)
-                .then(worker::Worker::spawn)
+            worker: (in_order_expected
+                && body_len >= worker::MIN_BODY
+                && max_chunk <= worker::MAX_CHUNK as u64)
+                .then(|| worker::Worker::spawn(Sha256::new()))
                 .flatten(),
         }
     }
@@ -121,10 +125,34 @@ impl IdentityTracker {
             // The worker died: the running hash can no longer be trusted to be
             // complete, so the identity is reported unverifiable rather than
             // wrong or skipped.
-            self.feasible = false;
+            self.mark_infeasible();
             return;
         }
         self.hasher.update(bytes);
+    }
+
+    /// The chunks stopped arriving in file order: the running hash can never
+    /// be completed, so stop hashing and release the worker thread.
+    pub(super) fn mark_infeasible(&mut self) {
+        self.feasible = false;
+        #[cfg(feature = "parallel-identity")]
+        {
+            self.worker = None; // joins
+        }
+    }
+
+    /// Stop the worker thread and continue inline from the state it reached
+    /// (used when the stream suspends). If the worker cannot hand its state
+    /// back the identity becomes infeasible, never wrong.
+    #[cfg_attr(not(feature = "parallel-identity"), allow(clippy::unused_self))]
+    pub(super) fn release_worker(&mut self) {
+        #[cfg(feature = "parallel-identity")]
+        if let Some(w) = self.worker.take() {
+            match w.snapshot() {
+                Some(h) => self.hasher = h,
+                None => self.feasible = false,
+            }
+        }
     }
 
     /// The digest of everything absorbed so far, without consuming the tracker.

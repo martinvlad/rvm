@@ -105,6 +105,16 @@ pub enum Event<'a> {
         /// Chunk index.
         chunk_index: u32,
     },
+    /// A chunk of an already-finished multi-chunk segment arrived with the
+    /// right length, but its chunk table was freed when the segment finished,
+    /// so its bytes can no longer be checked. It is counted against the
+    /// duplicate budget and is never released or applied.
+    Unverified {
+        /// Segment id.
+        seg_id: u64,
+        /// Chunk index.
+        chunk_index: u32,
+    },
     /// The descriptor frame was repeated byte for byte after admission.
     DuplicateDescriptor,
     /// A chunk was released.

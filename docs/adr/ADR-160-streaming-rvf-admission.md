@@ -294,3 +294,19 @@ the Decision above disagree, this section records what was built and why.
       buffered path in file order (33-54 ms against 28.5) and in stage order
       (61-80 ms), and equal or better only when the link is the bottleneck
       (file order, 1 Gbit/s: 540 against 567 ms).
+19. **Round 3 and vectors `9d331d28…` (RV3-01, F4-05).** The identity worker
+    thread is joined as soon as the stream is poisoned, completes, suspends
+    (the running state is handed back and hashing continues inline on resume) or
+    the running hash becomes infeasible, and is not started when the descriptor's
+    stages are not in body order (stage-ordered delivery is expected out of file
+    order). A worker that dies makes the identity unverifiable, never verified.
+    Chunk tables are now **freed when their segment finishes**, so retained
+    table memory is bounded by the open segments (`max_table_bytes`). A late
+    chunk of a finished multi-chunk segment cannot be checked any more: it is
+    counted against `max_duplicate_frames`, never released, and reported as
+    `Event::Unverified` (not a fault, not a poison); a repeat of a finished
+    single-chunk segment is still verified (the leaf is in the descriptor entry)
+    and reported as `Duplicate`. Because finished tables are gone,
+    `finish_identity` rebuilds each segment's leaf list from the persisted bytes
+    (32 bytes per chunk, one segment at a time) and compares it with the signed
+    chunk-table hash, which is the same commitment.

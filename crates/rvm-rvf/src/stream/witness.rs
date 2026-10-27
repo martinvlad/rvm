@@ -292,6 +292,7 @@ pub fn push_witnessed_with<'a, const N: usize>(
         Ok(
             AdmissionEvent::TableVerified { .. }
             | AdmissionEvent::Duplicate { .. }
+            | AdmissionEvent::Unverified { .. }
             | AdmissionEvent::DuplicateDescriptor,
         )
         | Err(_) => {}

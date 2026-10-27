@@ -236,6 +236,7 @@ impl<'p> StreamVerifier<'p> {
     /// `finish_identity`.
     pub(crate) fn force_poison(&mut self, reason: StreamError, seg: Option<u64>, chunk: u32) {
         self.state = StreamState::Poisoned(reason);
+        self.identity = None; // joins any identity worker
         if self.poison_info.is_none() {
             self.poison_info = Some(PoisonInfo {
                 seg_id: seg,
@@ -266,6 +267,9 @@ impl<'p> StreamVerifier<'p> {
     /// Input ended before `Complete`: move to `Suspended`.
     pub fn end_of_input(&mut self) -> StreamState {
         if matches!(self.state, StreamState::Receiving | StreamState::Ready) {
+            if let Some(t) = &mut self.identity {
+                t.release_worker();
+            }
             self.state = StreamState::Suspended;
         }
         self.state
@@ -314,8 +318,16 @@ impl<'p> StreamVerifier<'p> {
             .max_duplicate_frames
             .unwrap_or(4 * total_chunks + 64);
         self.left = d.entries.len();
+        // Stage-ordered delivery (stages not already non-decreasing in body
+        // order) is expected to arrive out of file order, which makes the
+        // running hash infeasible at once: do not start a worker for it.
+        let stages_in_body_order = d.entries.windows(2).all(|w| w[0].stage <= w[1].stage);
         if h.flags & FLAG_IDENTITY_PRESENT != 0 {
-            self.identity = Some(IdentityTracker::new(h.body_len, self.max_chunk_len));
+            self.identity = Some(IdentityTracker::new(
+                h.body_len,
+                self.max_chunk_len,
+                stages_in_body_order,
+            ));
         }
         let ev = Event::DescriptorVerified {
             descriptor_hash: d.descriptor_hash,
@@ -451,7 +463,7 @@ impl<'p> StreamVerifier<'p> {
             let d = self.desc.as_ref().expect("descriptor installed");
             (d.header, d.entries.clone())
         };
-        let mut body_hash = IdentityTracker::new(h.body_len, 65536);
+        let mut body_hash = IdentityTracker::new(h.body_len, 65536, true);
         let mut buf = alloc::vec![0u8; 65536];
         // Re-verify the persisted body against the *signed commitments*, chunk
         // by chunk, while hashing it in file order. Reading is streamed in
@@ -459,6 +471,10 @@ impl<'p> StreamVerifier<'p> {
         // for the segment-granular profile.
         for (i, e) in entries.iter().enumerate() {
             let n = self.segs[i].n;
+            // Finished segments no longer hold their chunk table, so rebuild
+            // the leaf list from the persisted bytes (32 bytes per chunk, one
+            // segment at a time) and compare it with the signed commitment.
+            let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(n as usize);
             for idx in 0..n {
                 let len = h.chunk_len(e.stored_len, idx).unwrap_or(0);
                 let start = e.body_offset + h.chunk_size().map_or(0, |cs| u64::from(idx) * cs);
@@ -478,16 +494,17 @@ impl<'p> StreamVerifier<'p> {
                     body_hash.update(&buf[..k]);
                     done += k as u64;
                 }
-                let got: [u8; 32] = leaf.finalize().into();
-                let mut want = e.chunk_table_hash;
-                if let Some(l) = &self.segs[i].leaves {
-                    want.copy_from_slice(&l[idx as usize * 32..idx as usize * 32 + 32]);
-                }
-                if !bool::from(got.ct_eq(&want)) {
-                    // The persisted body is not the one that was streamed.
-                    self.force_poison(StreamError::ChunkHashMismatch, Some(e.seg_id), idx);
-                    return Err(StreamError::ChunkHashMismatch);
-                }
+                leaves.push(leaf.finalize().into());
+            }
+            let got = if n == 1 {
+                leaves[0]
+            } else {
+                super::commit::chunk_list_hash(&h.file_id, e.seg_id, &leaves)
+            };
+            if !bool::from(got.ct_eq(&e.chunk_table_hash)) {
+                // The persisted body is not the one that was streamed.
+                self.force_poison(StreamError::ChunkHashMismatch, Some(e.seg_id), 0);
+                return Err(StreamError::ChunkHashMismatch);
             }
         }
         let confirmed = body_hash.feasible

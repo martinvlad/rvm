@@ -114,6 +114,13 @@ pub enum AdmissionEvent<'a> {
         /// Chunk index (0 for a table).
         chunk_index: u32,
     },
+    /// A late chunk of a finished multi-chunk segment; unverifiable, ignored.
+    Unverified {
+        /// Segment id.
+        seg_id: u64,
+        /// Chunk index.
+        chunk_index: u32,
+    },
     /// The descriptor frame was repeated byte for byte; ignored.
     DuplicateDescriptor,
     /// A chunk was released.
@@ -220,6 +227,13 @@ impl<'p> StreamAdmission<'p> {
             }
             Event::TableVerified { seg_id } => Ok(AdmissionEvent::TableVerified { seg_id }),
             Event::DuplicateDescriptor => Ok(AdmissionEvent::DuplicateDescriptor),
+            Event::Unverified {
+                seg_id,
+                chunk_index,
+            } => Ok(AdmissionEvent::Unverified {
+                seg_id,
+                chunk_index,
+            }),
             Event::Duplicate {
                 seg_id,
                 chunk_index,

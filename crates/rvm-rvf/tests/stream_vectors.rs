@@ -14,7 +14,7 @@ use rvm_rvf::{sha256, SizePolicy};
 use serde_json::Value;
 
 const VECTORS: &str = include_str!("vectors/rvsd-v1-vectors.json");
-const PINNED_SHA256: &str = "e442f865dc06b48a04337f45907c434e0e72644b76ee83c9580ac4837f78bb33";
+const PINNED_SHA256: &str = "9d331d28dd370da5f65102abf512d0f85a7e9feb78bb44c477c19f90a36309fe";
 
 fn hex(s: &str) -> Vec<u8> {
     (0..s.len() / 2)
@@ -117,6 +117,19 @@ fn check_event(frame: usize, got: &Event<'_>, want: &Value) {
             assert_eq!(*body_len, want["body_len"].as_u64().unwrap());
         }
         (Event::DuplicateDescriptor, "DuplicateDescriptor") => {}
+        (
+            Event::Unverified {
+                seg_id,
+                chunk_index,
+            },
+            "Unverified",
+        ) => {
+            assert_eq!(*seg_id, want["seg_id"].as_u64().unwrap(), "f{frame}");
+            assert_eq!(
+                u64::from(*chunk_index),
+                want["chunk_index"].as_u64().unwrap()
+            );
+        }
         (
             Event::Duplicate {
                 seg_id,

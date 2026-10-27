@@ -1170,7 +1170,7 @@
           "complete": null
         },
         {
-          "event": "Duplicate",
+          "event": "Unverified",
           "seg_id": 3,
           "chunk_index": 0
         },

@@ -214,3 +214,46 @@ fn identity_verdicts_do_not_depend_on_where_the_identity_hash_runs() {
         "the final chunk is not released"
     );
 }
+
+#[test]
+fn a_late_chunk_of_a_finished_multi_chunk_segment_is_unverified_and_never_applied() {
+    use rvm_rvf::stream::Event;
+    let b = builder(12, Order::File);
+    let bundle = b.build(&good_body()).unwrap();
+    let keys = [b.public_key()];
+    // Stop one frame before the end so the stream stays open.
+    let n = bundle.frames.len();
+    let mut p = policy(&keys, 0);
+    p.max_duplicate_frames = Some(3);
+    let mut v = StreamVerifier::new(p);
+    for f in &bundle.frames[..n - 1] {
+        v.push(f).unwrap();
+    }
+    let released = v.released_chunks();
+    // First chunk of the 10 000-byte vector segment (3 chunks, table freed).
+    let late = bundle
+        .frames
+        .iter()
+        .find(|f| f[0] == 1 && f[1..9] == 3u64.to_le_bytes() && f[9..13] == 0u32.to_le_bytes())
+        .unwrap();
+    assert!(matches!(
+        v.push(late).unwrap(),
+        Event::Unverified {
+            seg_id: 3,
+            chunk_index: 0
+        }
+    ));
+    // Even a corrupted copy cannot be told from the original any more: it is
+    // unverified, not applied, not a hash fault.
+    let mut bad = late.clone();
+    let l = bad.len();
+    bad[l - 1] ^= 1;
+    assert!(matches!(v.push(&bad).unwrap(), Event::Unverified { .. }));
+    assert_eq!(v.released_chunks(), released, "nothing was released");
+    assert_eq!(v.faults(), 0);
+    // A finished single-chunk segment is still verified: a corrupted copy is a fault.
+    let single = &bundle.frames[1];
+    assert!(matches!(v.push(single).unwrap(), Event::Duplicate { .. }));
+    // The budget (3) caps the storm: the next repeat poisons.
+    assert_eq!(v.push(late).err(), Some(StreamError::DuplicateFlood));
+}

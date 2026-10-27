@@ -54,7 +54,7 @@ impl StreamVerifier<'_> {
                 t.update(bytes);
                 t.pos += bytes.len() as u64;
             } else {
-                t.feasible = false;
+                t.mark_infeasible();
             }
         }
         // The identity verdict is reached before anything is advanced, so a
@@ -72,6 +72,12 @@ impl StreamVerifier<'_> {
         s.next += 1;
         if completes_segment {
             s.done = true;
+            // The table is only needed while the segment is open: freeing it
+            // bounds retained memory by the open segments (late repeats of a
+            // finished multi-chunk segment are `Unverified`, never applied).
+            if let Some(l) = s.leaves.take() {
+                self.table_bytes -= l.len() as u64;
+            }
             self.left -= 1;
             let st = e.stage as usize;
             self.stage_remaining[st] -= 1;
@@ -83,6 +89,8 @@ impl StreamVerifier<'_> {
         self.released_chunks += 1;
         if let Some(st) = complete {
             self.identity_status = Some(st);
+            // Terminal: the running hash and its worker thread are done.
+            self.identity = None;
             self.state = if st == IdentityStatus::Unverifiable {
                 StreamState::CompleteUnverified
             } else {
@@ -176,6 +184,14 @@ impl StreamVerifier<'_> {
         let mut want = e.chunk_table_hash;
         if let Some(l) = &self.segs[i].leaves {
             want.copy_from_slice(&l[idx as usize * 32..idx as usize * 32 + 32]);
+        } else if self.segs[i].n > 1 {
+            // A finished multi-chunk segment: the table is gone, the bytes
+            // cannot be checked. Count it, release nothing.
+            self.count_duplicate(seg_id, idx)?;
+            return Ok(Event::Unverified {
+                seg_id,
+                chunk_index: idx,
+            });
         }
         if !bool::from(leaf_hash(&h.file_id, seg_id, idx, bytes).ct_eq(&want)) {
             return Err(self.fault(StreamError::ChunkHashMismatch, Some(seg_id), idx));
