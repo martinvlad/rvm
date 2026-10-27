@@ -2757,7 +2757,7 @@ dependencies = [
 
 [[package]]
 name = "rvm-context"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ed25519-dalek",
  "proptest",
@@ -2829,7 +2829,7 @@ dependencies = [
 
 [[package]]
 name = "rvm-host"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "rvm-cap",
  "rvm-partition",
@@ -2860,7 +2860,7 @@ dependencies = [
 
 [[package]]
 name = "rvm-launch"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "peak_alloc",
  "proptest",
@@ -2907,7 +2907,7 @@ dependencies = [
 
 [[package]]
 name = "rvm-rvf"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ed25519-dalek",
  "peak_alloc",
@@ -2972,7 +2972,7 @@ dependencies = [
 
 [[package]]
 name = "rvm-wasm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "peak_alloc",
  "proptest",
