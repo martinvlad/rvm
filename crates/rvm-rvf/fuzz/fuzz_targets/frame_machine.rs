@@ -8,7 +8,10 @@
 //! * every released chunk is byte-identical to the signed body (P1);
 //! * the result does not depend on how the bytes were split (same state, same
 //!   released chunks);
-//! * `Complete` only if every released chunk reassembles the signed body.
+//! * `Complete`/`CompleteUnverified` only if every released chunk reassembles the signed body.
+//!
+//! Seeds (derived from the shared vectors, regenerate with the ignored test
+//! `write_fuzz_seeds`): `cargo +nightly fuzz run frame_machine corpus/frame_machine seeds/frame_machine`.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -50,7 +53,7 @@ type Released = Vec<(u64, u32, u64, Vec<u8>)>;
 fn run(budget: u32, split: usize, bytes: &[u8]) -> (StreamState, Released) {
     let v = vectors();
     let keys = [v.key];
-    let mut policy = StreamPolicy::new(&keys);
+    let mut policy = StreamPolicy::unpinned_insecure(&keys);
     policy.fault_budget = budget;
     let mut ver = StreamVerifier::new(policy);
     let mut reader = FrameReader::new();
@@ -88,7 +91,7 @@ fuzz_target!(|data: &[u8]| {
     let (sb, rb) = run(budget, b, bytes);
     assert_eq!(sa, sb, "state depends on how the bytes were split");
     assert_eq!(ra, rb, "released chunks depend on how the bytes were split");
-    if sa == StreamState::Complete {
+    if matches!(sa, StreamState::Complete | StreamState::CompleteUnverified) {
         // Complete means every segment verified: the released chunks tile a body.
         let total: usize = ra.iter().map(|c| c.3.len()).sum();
         assert!(vectors().bodies.iter().any(|b| b.len() == total));

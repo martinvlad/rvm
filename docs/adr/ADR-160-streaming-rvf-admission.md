@@ -76,42 +76,131 @@ the Decision above disagree, this section records what was built and why.
    never admitted that `verify` would refuse on size, but a package at the very
    edge of a class budget can be refused by the stream and accepted by `verify`.
 2. **Item 5 timing.** `StreamSession::take_module` yields a `VerifiedModule`
-   only when the stream is `Complete` and admission passed, not as soon as the
-   module's own segment verifies: the capability mapping and the root-manifest
-   rule are package-level facts. Stage ordering therefore bounds memory and
-   gives early rejection, but does not yet let a component start before the
-   rest of the package arrives. Early start of a verified component is future
-   work.
+   only when the stream is `Complete`, admission passed **and the identity is
+   verified**. It is not available as soon as the module's own segment
+   verifies: the capability mapping and the root-manifest rule are
+   package-level facts. Stage ordering therefore bounds memory and gives early
+   rejection but does not yet let a component start before the rest of the
+   package arrives. Early start of a verified component is future work.
 3. **Item 5 placement.** `StreamSession` and `VerifiedModule` live in
    `rvm-launch`: the session must name `rvm-rvf`, `rvm-wasm` and `Instance`;
    `rvm-host` sits below `Instance`. `Instance::start_verified` moves the
    module into the instance's own storage; start is admission and slot
    activation only.
-4. **Item 6 revocation.** `Poisoned` revokes through `rvm-cap`'s epoch bump,
-   which is global to the `CapabilityManager`. `CapabilityMapping::install`
-   does not return the handles it creates, so a targeted revoke of one
-   package's capabilities is not reachable; a caller that kept the handles can
-   revoke them itself. Instances started from the stream are terminated by
-   descriptor hash; the session drops its derived state.
+4. **Item 6 poison effects (revised after review RV-01, RV-02, RV-09).**
+   There is no global capability epoch bump. A session that installs a
+   package's capabilities (`install_capabilities`, built on
+   `CapabilityMapping::install_tracked`, which returns the `(index,
+   generation)` handles) remembers them, and a poisoned session issues one
+   `#[must_use] PoisonObligation` (`take_obligation`) naming exactly those
+   handles and the instances it started. Instances remember a **per-session
+   id** (a process-unique counter, not derived from anything the transport
+   controls), not the descriptor hash, so a session cannot reach another
+   tenant that streams the same package. A poison before any descriptor was
+   authenticated issues no obligation: the session is dead and nothing else is
+   touched. Because identity must be verified before anything is granted
+   (item 8) and `Complete` is terminal, a session that has granted something
+   cannot currently be poisoned afterwards; the obligation is the contract an
+   early-start extension must discharge, and `PoisonObligation::for_session`
+   lets a host register installs it made by other means.
 5. **Item 7 declaration.** A stream-profiled package carries a `META` line
-   `rvm.stream_profile=required`. It cannot carry the descriptor hash: the
-   descriptor commits to the body, so a body containing its own descriptor hash
-   would be circular. The binding is the descriptor's `rvf_identity`, which
-   covers the line. `VerifyOptions::permit_buffered_stream_profile` (default
-   off) is the explicit permission; without it `verify` records a failed
-   `CheckKind::StreamProfile`. A package that does not carry the line is
-   unaffected, so a publisher who omits it still downgrades to the buffered
-   path; closing that needs the package contract (ADR-155 section 5) to carry
-   the declaration outside the body, which is not built.
-6. **Behaviour taken from the shared vectors (RuVector ADR-353 clarified).**
-   Identity is checked over released bytes only while chunks arrive in file
-   order; stage-ordered delivery completes with an `Unverifiable` identity and
-   `finish_identity(read_at)` checks a persisted body. The identity check runs
-   before the final chunk is released. A chunk whose `requires_mask` stages are
-   not verified is a counted fault, not a held chunk. `rvf_identity` must be
-   zero when `identity_present` is clear, and cycles between stage requirements
-   are rejected. `checksum_algo` 0 or 1 on an executable or index segment
-   poisons the stream.
-7. **Witness.** Stream events use the existing record path with new
-   `CheckKind` values (`StreamDescriptor`, `StreamSegment`, `StreamPoisoned`,
-   `StreamComplete`, `StreamModule`) and the numeric reason in `aux[6..8]`.
+   `rvm.stream_profile=required` (read as bytes, so non-UTF-8 junk cannot hide
+   it). It cannot carry the descriptor hash: the descriptor commits to the
+   body, so a body containing its own descriptor hash would be circular. The
+   binding is the descriptor's `rvf_identity`, which covers the line.
+   `VerifyOptions::permit_buffered_stream_profile` is the explicit permission,
+   and **only takes effect with a pinned `expected_identity`**. The line is
+   unsigned, so anyone who can change the bytes can strip it (review RV-08); a
+   host whose policy is "packages are stream-delivered" sets
+   `VerifyOptions::require_pinned_identity`, which makes the buffered loader
+   refuse any package not pinned by identity. The residual, stated plainly: an
+   unpinned buffered package is by definition unauthenticated as to its stream
+   profile. Closing it fully needs the package contract (ADR-155 section 5) to
+   carry the declaration outside the body.
+6. **Behaviour taken from the shared vectors (RuVector ADR-353 clarified,
+   vectors sha256 `e442f865…bb33`).**
+   - Identity is checked over released bytes only while chunks arrive in file
+     order. A stage-ordered stream ends in `CompleteUnverified`; `Complete`
+     always means the identity is confirmed. `finish_identity(read_at)` moves
+     `CompleteUnverified` to `Complete` or `Poisoned`.
+   - `Complete`, `CompleteUnverified`, `Suspended` and `Rejected` are never
+     turned into `Poisoned` by a later frame or a reader-level size lie; any
+     frame after completion is refused with `StreamBadState`.
+   - The identity check runs before the final chunk is released.
+   - A chunk whose `requires_mask` stages are not verified is a counted fault.
+   - `rvf_identity` must be zero when `identity_present` is clear; entry
+     `flags` must be zero; stage requirements must be acyclic; the root-page
+     pseudo-entry (`0xFE`) must be last, exactly 4096 bytes, `uncompressed_len`
+     0, and its first chunk must begin with the root magic.
+   - `checksum_algo` 0 or 1 on an executable or index segment poisons the
+     stream. This is the only place the rule applies (RF-04): the buffered
+     loader keeps accepting those segments because their authenticity there is
+     the segment signature, whereas on the stream path the SHA-256 leaf already
+     authenticates the bytes and the weak checksum would only be a parser
+     input. `hash.rs` documents algorithm 1 as the writer default, so every
+     default-written executable is refused on the stream path; publishers of
+     streamed executables use algorithm 2. Algorithms 3 and 4..255 verify
+     with XXH3 as before.
+   - Duplicates: a chunk with an index below the next expected one whose bytes
+     hash to the verified leaf is **ignored** (not a fault) and counted
+     against `max_duplicate_frames` (default `4 * total chunks + 64`, then
+     `StreamDuplicateFlood` 0x081A); with different bytes it is a leaf-mismatch
+     fault. A byte-identical repeated descriptor is ignored; a different one
+     is a fault. A replayed authentic frame therefore cannot poison a stream
+     (RV-02). Chunk tables are retained for the life of the stream (cap
+     `max_table_bytes`, default 64 MiB, a counted fault) so a duplicate can be
+     checked.
+   - An epoch pin is `(epoch, descriptor_hash, signer_key_id)`, keyed by
+     `file_id`, and constrains only descriptors from that signer.
+7. **Witness (revised after RV-04, RV-05).** Stream events use the existing
+   record path with new `CheckKind` values (`StreamDescriptor`,
+   `StreamSegment`, `StreamPoisoned`, `StreamComplete`, `StreamModule`,
+   `StreamFault`) and the numeric reason in `aux[6..8]`. Counted faults, a
+   failed `finish_identity` and reader-level poison are witnessed. For a
+   package refused after `Complete` the failing `VerificationRecord`s of the
+   report are written (as `emit_report` does for the buffered path), and the
+   session writes `StreamComplete` only once the package is admitted.
+   Admission-level poisons keep their real reason through local codes
+   `0x0F00..` (`SegmentMalformed`, `SegmentMismatch`, `IdentityRequired`,
+   `TooManyOpenSegments`, `ClockRequired`); these are RVM-local, not
+   RuVector `ErrorCode` values.
+8. **Identity gates everything (RV-03).** Until the identity is verified the
+   session exposes no `VerifiedModule`, no `VerifiedPackage`, and
+   `install_capabilities` refuses. A pinned `expected_identity` is checked
+   against the descriptor's claim, so it is only as strong as the verification
+   of that claim.
+9. **Replay protection is a choice, and the pin is recorded after admission
+   (RV-07).** `StreamPolicy::new(keys, ReplayProtection)` has no default;
+   `unpinned_insecure` is the visibly insecure spelling. `ReplayProtection::Store`
+   uses a `PinStore` (reference: `MemoryPinStore`; a production host persists
+   it). A descriptor with `expires_ns` set is refused (`ClockRequired`) when the
+   policy is pinned but has no trusted clock. The session records
+   `(epoch, descriptor_hash, signer)` exactly once, when the stream is
+   `Complete`, its identity is verified and the package passed admission; a
+   cut, poisoned or refused stream never moves the pin.
+10. **Size lies and the session (RV-06).** `StreamSession::feed` /
+    `feed_witnessed` drive a `FrameReader` with the limits the signed
+    descriptor implies, so a hostile size claim is refused before a payload
+    byte is buffered (allocator-counting test: under 1 KiB). `push` takes an
+    already-buffered frame and cannot apply the limit.
+11. **Root page (RF-01).** `split_root_page` no longer triggers on the magic
+    alone: the trailing 4096 bytes must be a structurally valid Level-0 page
+    (`RVM0` magic, version 1, signature length within the buffer, CRC32C of
+    bytes `0..0xFFC` at `0xFFC`). The RuVector shared fixtures with a page
+    (`forge_signed_rvm0.rvf`, `runtime_signed_wire.rvf`) satisfy it. This is
+    stricter than `rvf-forge-core`'s magic-only split; a writer whose page
+    carries no valid CRC is no longer split off by the buffered path. A payload
+    that contains a *complete valid* Level-0 page at `len - 4096` is still
+    indistinguishable from a page by the buffered walk (the stream path is not
+    affected: the descriptor cuts the segments).
+12. **Smaller changes.** A segment header may not claim a larger
+    `uncompressed_len` than the signed entry (RF-03).
+    `discard_derived_state` on a live stream poisons it instead of leaving a
+    later panic (RF-02). `ModulePolicy` bounds table elements, globals, data
+    segments and element segments (RW-01).
+13. **Frame ownership (RV-10).** Confirmed that a frame is hashed in place and
+    then read again by the segment checker, the metadata copy and the module
+    validator. In safe Rust those are the same bytes (a `&[u8]` cannot be
+    mutated while borrowed); the guarantee ends at an FFI or shared-memory
+    boundary, where the caller must copy into verifier-owned memory first. No
+    extra copy is made on the safe path.

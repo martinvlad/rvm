@@ -267,8 +267,7 @@ impl CapabilityMapping {
     /// # Errors
     ///
     /// [`RvfError::CapabilityTableFull`] when the table runs out of slots.
-    /// Slots already inserted are left in place: the caller holds the table
-    /// and is the only party that can decide whether to unwind it.
+    /// Slots already inserted are removed again (see [`Self::install_tracked`]).
     pub fn install<const N: usize>(
         &self,
         table: &mut CapabilityTable<N>,
@@ -276,17 +275,44 @@ impl CapabilityMapping {
         epoch: u32,
         first_cap_id: u64,
     ) -> RvfResult<usize> {
+        self.install_tracked(table, owner, epoch, first_cap_id)
+            .map(|handles| handles.len())
+    }
+
+    /// [`Self::install`], returning the `(index, generation)` handle of every
+    /// capability inserted, so the installer (and only the installer) can later
+    /// revoke exactly these: a stream session that installs a package's
+    /// capabilities revokes them, and nothing else, if the stream is poisoned.
+    ///
+    /// # Errors
+    ///
+    /// [`RvfError::CapabilityTableFull`] when the table runs out of slots. The
+    /// slots already inserted are removed again before the error is returned,
+    /// so a failed install leaves the table as it found it.
+    pub fn install_tracked<const N: usize>(
+        &self,
+        table: &mut CapabilityTable<N>,
+        owner: PartitionId,
+        epoch: u32,
+        first_cap_id: u64,
+    ) -> RvfResult<Vec<(u32, u32)>> {
+        let mut handles = Vec::with_capacity(self.granted.len());
         for (i, binding) in self.granted.iter().enumerate() {
             let id = first_cap_id.wrapping_add(i as u64);
             let token = CapToken::new(id, binding.cap_type, binding.rights, epoch);
             let badge = binding.class as u64;
             // `insert_root` can only fail by running out of slots; every
             // other CapError variant belongs to lookup and derivation.
-            if table.insert_root(token, owner, badge).is_err() {
+            if let Ok(handle) = table.insert_root(token, owner, badge) {
+                handles.push(handle);
+            } else {
+                for (index, generation) in handles {
+                    let _ = table.remove(index, generation);
+                }
                 return Err(RvfError::CapabilityTableFull);
             }
         }
-        Ok(self.granted.len())
+        Ok(handles)
     }
 }
 

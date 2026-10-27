@@ -17,7 +17,7 @@ All integers in the formats are little-endian; all `*_hex` values are lowercase 
 | `other_body_hex` | Body of the other file (differs only in segment 5). |
 | `stages_by_segment_order` | Stage per segment in body order, used by the `*-stage` streams. |
 | `streams` | Four positive streams: `m1-file`, `m1-stage` (`chunk_log2` 255, one chunk per segment) and `m2-file`, `m2-stage` (`chunk_log2` 12, 4 KiB chunks). `*-stage` streams set `requires_mask` to all lower stages and deliver frames in `(stage, body order)`. |
-| `positive_variants` | Positive cases built by editing a stream (see `edits`). |
+| `positive_variants` | Positive cases built by editing a stream (see `edits`); they carry the per-frame `events` and must end `Complete`. Policy may also set `max_duplicate_frames` (null = default). |
 | `negative` | Cases that must be refused. |
 
 ## Streams
@@ -29,8 +29,8 @@ otherwise the chunk-list hash. `frames[i].hex` is the exact frame (type byte
 included) and `frames[i].expect` the event a verifier with the default policy
 (`fault_budget` 4, trusted key = test key) must produce for it:
 `DescriptorVerified`, `TableVerified`, `Chunk` (with `segment_verified`,
-`stage_verified`, and `complete` = `Verified`, `Unverifiable` or null) or `Error`.
-`final_state` is the verifier state after the last frame.
+`stage_verified`, and `complete` = `Verified`, `Unverifiable`, `NotPresent` or null) or `Error`.
+`final_state` is the verifier state after the last frame: `Complete` for the file-order streams, `CompleteUnverified` for the `*-stage` streams (identity not confirmable without the persisted body).
 
 ## Frames
 
@@ -56,13 +56,88 @@ included) and `frames[i].expect` the event a verifier with the default policy
 
 ## Negative cases
 
-Each entry in `negative` names a base `stream`, a `policy` (trust set, `fault_budget`, `epoch_pin`, `now_ns`; all other limits default), and `edits` applied in order to the base frame list:
+Each entry in `negative` names a base `stream`, a `policy` (trust set, `fault_budget`, `epoch_pin`, `now_ns`; all other limits default). An `epoch_pin` applies only to the given `signer_key_id_hex` and `file_id_hex`, and its `descriptor_hash_hex` is mandatory, and `edits` applied in order to the base frame list:
 `xor {frame, offset, mask}` (offsets are into the frame bytes), `drop {frame}`, `dup {frame}` (insert a copy after), `swap {a, b}`, `keep_first {count}`, `insert {at, hex}`, `replace {frame, hex}`, `cut_tail_bytes {frame, bytes}`.
 `expect` gives the `first_error_frame` index, `reason` and `code` (the error code of the first refused frame), the `final_state` (`Rejected:<reason>`, `Poisoned:<reason>`, `Receiving`), and how many chunks and bytes were released. Every frame after a poisoning must be refused with `StreamPoisoned` (0x0817) and release nothing.
 
 ## Rules the vectors rely on (clarifications of ADR-353)
 
-* Frames of a size that contradicts the signed descriptor, a chunk table whose `n` is wrong, and a frame shorter than its own header poison the stream at once (`StreamFrameSizeLie`). Duplicate, out-of-order, unknown-segment, unknown-type and chunk-before-table frames are counted faults (`StreamUnexpectedFrame`); a leaf or table hash mismatch is a counted fault; a chunk whose `requires_mask` stages are not fully verified is a counted fault (`StreamRequirementsUnmet`). The stream is poisoned when the fault count exceeds `fault_budget`. A refused frame never advances the expected chunk.
-* `rvf_identity` must be all zero when `identity_present` is clear.
+* Frames of a size that contradicts the signed descriptor, a chunk table whose `n` is wrong, and a frame shorter than its own header poison the stream at once (`StreamFrameSizeLie`). Future-index, unknown-segment, unknown-type and chunk-before-table frames, and a different descriptor frame after admission, are counted faults (`StreamUnexpectedFrame`); a leaf or table hash mismatch is a counted fault; a chunk whose `requires_mask` stages are not fully verified is a counted fault (`StreamRequirementsUnmet`). The stream is poisoned when the fault count exceeds `fault_budget`. A refused frame never advances the expected chunk.
+* `rvf_identity` must be all zero when `identity_present` is clear. `StreamEntry.flags` must be zero. The root-page pseudo-entry (type 254) must be last, 4096 bytes, `uncompressed_len` 0, and start with the Level-0 root magic bytes `30 4d 56 52`.
+* Duplicates: a chunk frame with index below the segment's next expected index whose bytes hash to the verified leaf is ignored (event `Duplicate`, nothing released, not a fault); with different bytes it is a leaf-mismatch fault. A byte-identical descriptor frame after admission is ignored (event `DuplicateDescriptor`). Duplicates count against `max_duplicate_frames` (default `4 * total chunks + 64`); exceeding it poisons with `StreamDuplicateFlood` (0x081A). Accepted chunk tables are retained (cap `max_table_bytes`); a second table frame for a segment is still a fault. After `Complete` any frame is refused with `StreamBadState`.
+* Complete, CompleteUnverified and Suspended are never turned into Poisoned; further bytes are refused with `StreamBadState`. A pin and chunk-table memory are bounded: tables held at once are capped by `max_table_bytes` (default 64 MiB, `StreamLimitExceeded`).
 * The running identity SHA-256 is fed only while chunks arrive contiguously in file order. Otherwise `complete` is `Unverifiable` (the consumer may re-read its persisted body and compare).
-* Error codes are `rvf-types` `ErrorCode` values `0x0805..=0x0819` plus the existing `UnknownSigner` 0x0802; see `rvf-types/src/error.rs`.
+* Error codes are `rvf-types` `ErrorCode` values `0x0805..=0x081A` plus the existing `UnknownSigner` 0x0802; see `rvf-types/src/error.rs` (0x0818 is reserved, 0x081A is `StreamDuplicateFlood`).
+
+---
+
+# Shared RVF byte fixtures (ADR-354 item 6)
+
+Byte fixtures shared with the rvm repo (`rvm-rvf` must accept the first three;
+see ADR-354 acceptance). Each is checked by a test in this repo; none is edited
+by hand.
+
+| File | Bytes | SHA-256 | Writer | Reproducible |
+|---|---:|---|---|---|
+| `runtime_wire_dialect.rvf` | 1792 | `e4341aebdd4c645aaf84739008e1e8ae5de2eebbaddc0fee4e5b829c1e209136` | `RvfStore::create` (wire dialect: 64-byte padded segments, `checksum_algo` 1) | structurally |
+| `runtime_signed_wire.rvf` | 6912 | `238e2fb0d18d095031f14f1fcb927ef2e50a875f4164d2e9729f94767a268976` | `RvfStore::create_signed` (algo 2, per-segment hash trailer, signed `RVM0` page at EOF) | structurally |
+| `forge_signed_rvm0.rvf` | 4928 | `26c3c90cd5cfa4266c1def8ab3a64922201f77c08a736d2039d723bf2b27ce72` | `rvf-forge-core` `ContainerBuilder` (algo 2, signed segments, 4096-byte `RVM0` root page) | byte-exact |
+| `legacy/legacy_basic.rvf` | 1401 | `981c7718d62db8f4fa30d9468898f95ac787ba8df1085a5bbaac0d76f12348aa` | pre-ADR-354 `RvfStore` (algo 0 CRC-rotation, unpadded) | frozen |
+| `legacy/legacy_multi.rvf` | 6221 | `360cee29083e84e377d83ede88f949d6f1446b6e6c56ee0bd6ead30100d7a624` | pre-ADR-354 `RvfStore` | frozen |
+| `legacy/legacy_compacted.rvf` | 2448 | `fd7f6cb8af37f594128a7dc63b206a17a0cf18791d4c84a9c348dee519f6ebfa` | pre-ADR-354 `RvfStore` | frozen |
+
+## How each was generated
+
+**`runtime_wire_dialect.rvf`**: `RvfStore::create` with dimension 8, L2, all
+witness options off (witness segments embed the wall clock), two ingest batches
+of 10 vectors from a fixed LCG seed (`vecs(10, 8, 100 + b)`), `close()`.
+Generator: `gen_wire` in `rvf-runtime/tests/vectors.rs`.
+
+**`runtime_signed_wire.rvf`**: same data via `RvfStore::create_signed` with the
+Ed25519 secret key `[0x42; 32]`, then `delete(&[3])`, `close()` (19 live
+vectors). Trusted public key for `open_with_policy(.., Strict)`:
+`Ed25519 public of [0x42; 32]` (`rvf_types::ed25519::Ed25519Keypair::from_secret`).
+Generator: `gen_signed` in the same test.
+
+**`forge_signed_rvm0.rvf`**: `ContainerBuilder::new()` with file id
+`b"ofer-forge-fixt\0"`, capability `Network`, a `Wasm` segment
+`\0asm\x01\0\0\0ofer fixture module`, a `Vec` segment of 200 bytes `0x5a`,
+signed with Ed25519 secret key `[7; 32]`. Forge reads no clock, so the output is
+byte-reproducible. Test: `crates/rvf-forge-core/tests/shared_vectors.rs`.
+
+**`legacy/*.rvf`**: written by the writer at commit `b3fcc8520` (before any
+ADR-354 change) using `legacy/gen_legacy.rs.txt` (an `examples/` program; kept
+as `.txt` because it only produces legacy files when run at that commit).
+`legacy/legacy_expected.txt` holds the status line and the top-5 hits (ids and
+raw `f32` distance bits) for three fixed queries per file, recorded from the
+same old code. The tests in `rvf-runtime/tests/legacy_dialect.rs` open copies
+and require identical results.
+
+## Determinism notes
+
+`RvfStore` is not byte-deterministic: the file id mixes the path hash and the
+clock, and it is embedded in the manifest (and hashed into later manifests'
+hash trailers and the signed page). The regeneration tests therefore compare
+structurally: segment sequence (type, id, `checksum_algo`, payload length,
+padding), every non-manifest payload and header hash byte-for-byte, and
+manifest payloads with the 68-byte FileIdentity and the hashes of earlier
+manifest segments masked. Forge output is compared byte-for-byte.
+
+Regenerate the two RvfStore fixtures and the Forge fixture with
+`OFER_REGEN_VECTORS=1 cargo test` (in `crates/rvf` for `-p rvf-runtime --test
+vectors`, in the repo root for `-p rvf-forge-core --test shared_vectors`).
+Regenerating changes bytes and hashes above; update this table and the rvm
+repo's copies.
+
+## What rvm should expect
+
+* `runtime_wire_dialect.rvf` has no root page and an unsigned manifest; the
+  segments tile the file at 64-byte strides and verify under `rvm-rvf::walk`.
+* `runtime_signed_wire.rvf` and `forge_signed_rvm0.rvf` end in a 4096-byte
+  `RVM0` page. `rvm-rvf::walk` must split it off (ADR-354 item 3, rvm side).
+  The runtime's page additionally carries `l1_content_hash` at `0xFD0` and the
+  signer fingerprint at `0xFE0` (inside the signed region); Forge's pages leave
+  both zero.
+* Level-0 `sig_algo` is `1` for Ed25519 (the segment-footer enumeration uses
+  `0`); the signature covers the page with `0x09C..0x0DC` and `0xFFC..`
+  zeroed.

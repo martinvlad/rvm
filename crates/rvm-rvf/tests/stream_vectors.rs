@@ -8,13 +8,13 @@
 
 use rvm_rvf::stream::{
     chunk_list_hash, decode_descriptor, descriptor_hash, leaf_hash, signer_key_id, EpochPin, Event,
-    IdentityStatus, StreamPolicy, StreamState, StreamVerifier,
+    IdentityStatus, ReplayProtection, StreamPolicy, StreamState, StreamVerifier,
 };
 use rvm_rvf::{sha256, SizePolicy};
 use serde_json::Value;
 
 const VECTORS: &str = include_str!("vectors/rvsd-v1-vectors.json");
-const PINNED_SHA256: &str = "e274900baf2788fee3714c392512efa145b737cd5d0c38a4179b0edee0ff6735";
+const PINNED_SHA256: &str = "e442f865dc06b48a04337f45907c434e0e72644b76ee83c9580ac4837f78bb33";
 
 fn hex(s: &str) -> Vec<u8> {
     (0..s.len() / 2)
@@ -35,8 +35,9 @@ fn vectors() -> Value {
 struct Case {
     keys: Vec<[u8; 32]>,
     fault_budget: u32,
-    pin: Option<EpochPin>,
+    pin: Option<([u8; 16], EpochPin)>,
     now_ns: Option<u64>,
+    max_duplicate_frames: Option<u64>,
 }
 
 impl Case {
@@ -49,23 +50,37 @@ impl Case {
                 .map(|k| hex32(k.as_str().unwrap()))
                 .collect(),
             fault_budget: p["fault_budget"].as_u64().unwrap() as u32,
-            pin: p["epoch_pin"].as_object().map(|o| EpochPin {
-                epoch: o["epoch"].as_u64().unwrap(),
-                descriptor_hash: o["descriptor_hash_hex"].as_str().map(hex32),
+            pin: p["epoch_pin"].as_object().map(|o| {
+                (
+                    hex(o["file_id_hex"].as_str().unwrap()).try_into().unwrap(),
+                    EpochPin {
+                        epoch: o["epoch"].as_u64().unwrap(),
+                        descriptor_hash: hex32(o["descriptor_hash_hex"].as_str().unwrap()),
+                        signer_key_id: hex(o["signer_key_id_hex"].as_str().unwrap())
+                            .try_into()
+                            .unwrap(),
+                    },
+                )
             }),
             now_ns: p["now_ns"].as_u64(),
+            max_duplicate_frames: p["max_duplicate_frames"].as_u64(),
         }
     }
 }
 
-fn run<'p>(case: &'p Case, pin: &'p dyn Fn(&[u8; 16]) -> Option<EpochPin>) -> StreamVerifier<'p> {
-    let mut policy = StreamPolicy::new(&case.keys);
+type PinFn<'p> = &'p dyn Fn(&[u8; 16]) -> Option<EpochPin>;
+
+fn run<'p>(case: &'p Case, pin: PinFn<'p>) -> StreamVerifier<'p> {
+    let mut policy = StreamPolicy::unpinned_insecure(&case.keys);
     policy.size = SizePolicy::permissive();
     policy.size.max_segments = 16384;
     policy.fault_budget = case.fault_budget;
-    policy.now_ns = case.now_ns;
-    if case.pin.is_some() {
-        policy.epoch_pin = Some(pin);
+    policy.max_duplicate_frames = case.max_duplicate_frames;
+    if case.pin.is_some() || case.now_ns.is_some() {
+        policy.replay = ReplayProtection::Lookup {
+            pin,
+            now_ns: case.now_ns,
+        };
     }
     StreamVerifier::new(policy)
 }
@@ -77,6 +92,7 @@ fn state_string(s: StreamState) -> String {
         StreamState::Receiving => "Receiving".into(),
         StreamState::Suspended => "Suspended".into(),
         StreamState::Complete => "Complete".into(),
+        StreamState::CompleteUnverified => "CompleteUnverified".into(),
         StreamState::Rejected(e) => format!("Rejected:{}", e.name()),
         StreamState::Poisoned(e) => format!("Poisoned:{}", e.name()),
     }
@@ -99,6 +115,20 @@ fn check_event(frame: usize, got: &Event<'_>, want: &Value) {
             );
             assert_eq!(u64::from(*seg_count), want["seg_count"].as_u64().unwrap());
             assert_eq!(*body_len, want["body_len"].as_u64().unwrap());
+        }
+        (Event::DuplicateDescriptor, "DuplicateDescriptor") => {}
+        (
+            Event::Duplicate {
+                seg_id,
+                chunk_index,
+            },
+            "Duplicate",
+        ) => {
+            assert_eq!(*seg_id, want["seg_id"].as_u64().unwrap(), "f{frame}");
+            assert_eq!(
+                u64::from(*chunk_index),
+                want["chunk_index"].as_u64().unwrap()
+            );
         }
         (Event::TableVerified { seg_id }, "TableVerified") => {
             assert_eq!(*seg_id, want["seg_id"].as_u64().unwrap(), "f{frame}");
@@ -163,6 +193,7 @@ fn positive_streams_produce_the_listed_events() {
             fault_budget: 4,
             pin: None,
             now_ns: None,
+            max_duplicate_frames: None,
         };
         let none = |_: &[u8; 16]| None;
         // Descriptor decode and every table entry.
@@ -172,7 +203,7 @@ fn positive_streams_produce_the_listed_events() {
             stream["descriptor_hash_hex"],
             "{name}"
         );
-        let mut p = StreamPolicy::new(&case.keys);
+        let mut p = StreamPolicy::unpinned_insecure(&case.keys);
         p.size = SizePolicy::permissive();
         let d = decode_descriptor(&desc_bytes, &p).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_eq!(d.entries.len(), stream["entries"].as_array().unwrap().len());
@@ -271,7 +302,7 @@ fn run_case(v: &Value, c: &Value) {
     let frames = apply_edits(&base, c["edits"].as_array().unwrap());
     let case = Case::from_json(&c["policy"]);
     let pin = case.pin;
-    let lookup = move |_: &[u8; 16]| pin;
+    let lookup = move |f: &[u8; 16]| pin.filter(|(id, _)| id == f).map(|(_, p)| p);
     let mut ver = run(&case, &lookup);
     let want = &c["expect"];
     let mut first_error = None;
@@ -279,7 +310,12 @@ fn run_case(v: &Value, c: &Value) {
         let before = (ver.released_chunks(), ver.verified_bytes());
         let was_poisoned = matches!(ver.state(), StreamState::Poisoned(_));
         match ver.push(f) {
-            Ok(_) => assert!(!was_poisoned, "{name}: frame {i} accepted after poison"),
+            Ok(ev) => {
+                assert!(!was_poisoned, "{name}: frame {i} accepted after poison");
+                if let Some(evs) = c["events"].as_array() {
+                    check_event(i, &ev, &evs[i]);
+                }
+            }
             Err(e) => {
                 if first_error.is_none() {
                     first_error = Some((i, e));
@@ -339,14 +375,14 @@ fn positive_variants_complete() {
 fn every_negative_case_is_refused_as_listed() {
     let v = vectors();
     let negatives = v["negative"].as_array().unwrap();
-    assert_eq!(negatives.len(), 30);
+    assert_eq!(negatives.len(), 32);
     for c in negatives {
         run_case(&v, c);
     }
 }
 
 /// Writes the fuzz seed corpus. Run with
-/// `FUZZ_SEED_DIR=crates/rvm-rvf/fuzz/corpus cargo test -p rvm-rvf --test stream_vectors -- --ignored write_fuzz_seeds`.
+/// `FUZZ_SEED_DIR=crates/rvm-rvf/fuzz/seeds cargo test -p rvm-rvf --test stream_vectors -- --ignored write_fuzz_seeds`.
 #[test]
 #[ignore = "writes files; run by hand to refresh the fuzz corpus"]
 fn write_fuzz_seeds() {

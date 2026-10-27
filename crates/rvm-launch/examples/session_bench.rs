@@ -3,8 +3,8 @@
 //! path.
 //!
 //! ```text
-//! cargo run --release -p rvm-launch --example stream_bench -- b3     # peak memory, one process per case
-//! cargo run --release -p rvm-launch --example stream_bench -- b4     # throughput
+//! cargo run --release -p rvm-launch --example session_bench -- b3     # peak memory, one process per case
+//! cargo run --release -p rvm-launch --example session_bench -- b4     # throughput
 //! ```
 //!
 //! B3 spawns itself once per case, because `VmHWM` is a process-lifetime high
@@ -84,7 +84,7 @@ fn builder(chunk_log2: u8) -> StreamBuilder {
 }
 
 fn policy(keys: &[[u8; 32]]) -> StreamPolicy<'_> {
-    let mut p = StreamPolicy::new(keys);
+    let mut p = StreamPolicy::unpinned_insecure(keys);
     p.size = SizePolicy::permissive();
     p.size.max_segments = 4096;
     p.max_segment_bytes = 1 << 40;

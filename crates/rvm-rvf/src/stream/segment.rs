@@ -63,6 +63,7 @@ pub(crate) struct SegmentChecker {
     seg_id: u64,
     seg_type: u8,
     stored_len: u64,
+    uncompressed_len: u64,
     body_offset: u64,
     pos: u64,
     head: [u8; SEGMENT_HEADER_SIZE],
@@ -77,11 +78,18 @@ pub(crate) struct SegmentChecker {
 }
 
 impl SegmentChecker {
-    pub(crate) fn new(seg_id: u64, seg_type: u8, body_offset: u64, stored_len: u64) -> Self {
+    pub(crate) fn new(
+        seg_id: u64,
+        seg_type: u8,
+        body_offset: u64,
+        stored_len: u64,
+        uncompressed_len: u64,
+    ) -> Self {
         Self {
             seg_id,
             seg_type,
             stored_len,
+            uncompressed_len,
             body_offset,
             pos: 0,
             head: [0; SEGMENT_HEADER_SIZE],
@@ -171,8 +179,13 @@ impl SegmentChecker {
         if SEGMENT_HEADER_SIZE as u64 + h.payload_length > self.stored_len {
             return Err(RvfError::PayloadOutOfBounds.into());
         }
-        if h.seg_type != self.seg_type || h.segment_id != self.seg_id {
-            // The descriptor and the segment disagree about what this is.
+        if h.seg_type != self.seg_type
+            || h.segment_id != self.seg_id
+            || u64::from(h.uncompressed_len) > self.uncompressed_len
+        {
+            // The descriptor and the segment disagree about what this is, or the
+            // header claims a larger uncompressed size than the signed entry
+            // (a consumer that trusted the header would bypass the bound).
             return Err(SegmentFault::DescriptorMismatch);
         }
         // The content hash is XXH3-128 unless the header says SHAKE-256; the

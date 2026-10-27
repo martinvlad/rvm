@@ -47,8 +47,8 @@ pub struct Instance<A: HostAdapter> {
     /// The module bytes this instance was started with through
     /// [`Self::start_verified`], held in the instance's own storage.
     pub(crate) module: Option<Vec<u8>>,
-    /// The descriptor hash of the stream this instance was started from.
-    pub(crate) stream_origin: Option<[u8; 32]>,
+    /// The stream session (and descriptor) this instance was started from.
+    pub(crate) stream_origin: Option<crate::stream_module::StreamOrigin>,
 }
 
 impl<A: HostAdapter> Instance<A> {

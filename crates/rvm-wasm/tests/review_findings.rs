@@ -42,17 +42,52 @@ impl Rng {
     }
 }
 
-/// RW-01 (hardening gap): ModulePolicy limits memory pages but not table size.
-/// A 6-byte table declaration asking for 10 M entries passes the default
-/// policy; at instantiation an engine would have to allocate ~80 MB.
+/// RW-01: the default policy bounds table size, globals, data segments and
+/// element segments, as it already bounded memory pages.
 #[test]
-fn rw01_default_policy_accepts_a_ten_million_entry_table() {
-    let m = wat("(module (table 10000000 funcref))");
-    assert!(m.len() < 40);
-    assert!(stream_ok(&ModulePolicy::default(), &m, &[]));
-    // ... while the same declaration for memory is refused by policy.
-    let mem = wat("(module (memory 2000))");
-    assert!(!stream_ok(&ModulePolicy::default(), &mem, &[]));
+fn rw01_default_policy_bounds_tables_globals_data_and_elements() {
+    let huge_table = wat("(module (table 10000000 funcref))");
+    assert!(huge_table.len() < 40);
+    assert!(!stream_ok(&ModulePolicy::default(), &huge_table, &[]));
+    assert!(stream_ok(&ModulePolicy::permissive(), &huge_table, &[]));
+    let imported = wat("(module (import \"env\" \"t\" (table 10000000 funcref)))");
+    let allow = ModulePolicy {
+        imports: rvm_wasm::ImportPolicy::AllowAll,
+        ..ModulePolicy::default()
+    };
+    assert!(!stream_ok(&allow, &imported, &[]));
+    // A modest table still passes.
+    assert!(stream_ok(
+        &ModulePolicy::default(),
+        &wat("(module (table 64 funcref))"),
+        &[]
+    ));
+
+    let p = |f: fn(&mut ModulePolicy)| {
+        let mut p = ModulePolicy::default();
+        f(&mut p);
+        p
+    };
+    let globals = wat(
+        "(module (global i32 (i32.const 1)) (global i32 (i32.const 2)) (global i32 (i32.const 3)))",
+    );
+    assert!(stream_ok(&p(|p| p.max_globals = 3), &globals, &[]));
+    assert!(!stream_ok(&p(|p| p.max_globals = 2), &globals, &[]));
+    let data = wat("(module (memory 1 2) (data (i32.const 0) \"a\") (data (i32.const 8) \"b\"))");
+    assert!(stream_ok(&p(|p| p.max_data_segments = 2), &data, &[]));
+    assert!(!stream_ok(&p(|p| p.max_data_segments = 1), &data, &[]));
+    let elems =
+        wat("(module (table 4 funcref) (func $f) (elem (i32.const 0) $f) (elem (i32.const 1) $f))");
+    assert!(stream_ok(&p(|p| p.max_element_segments = 2), &elems, &[]));
+    assert!(!stream_ok(&p(|p| p.max_element_segments = 1), &elems, &[]));
+    // The verdict does not depend on how the bytes are split.
+    for m in [&huge_table, &globals, &data, &elems] {
+        let cuts: Vec<usize> = (1..m.len()).collect();
+        assert_eq!(
+            stream_ok(&ModulePolicy::default(), m, &cuts),
+            stream_ok(&ModulePolicy::default(), m, &[])
+        );
+    }
 }
 
 /// RW-02: documented mismatch - the cheap framing check accepts a tag section
@@ -74,7 +109,7 @@ fn rw02_framing_accepts_what_the_validator_refuses() {
 fn probe_mutated_modules_agree_with_wasmparser_under_hostile_splits() {
     let mut seeds: Vec<Vec<u8>> = valid_modules().into_iter().map(|(_, m)| m).collect();
     seeds.extend(bad_modules().into_iter().map(|(_, m)| m));
-    let mut rng = Rng(0xC0FFEE_1234_5678);
+    let mut rng = Rng(0x00C0_FFEE_1234_5678);
     let policy = ModulePolicy::permissive();
     let mut accepted = 0u32;
     let mut disagreements: Vec<Vec<u8>> = Vec::new();
@@ -135,7 +170,10 @@ fn probe_mutated_modules_agree_with_wasmparser_under_hostile_splits() {
             }
         }
     }
-    assert!(accepted > 50, "mutations never reached a valid module: {accepted}");
+    assert!(
+        accepted > 50,
+        "mutations never reached a valid module: {accepted}"
+    );
     assert!(
         disagreements.is_empty(),
         "streaming != wasmparser on {} inputs, e.g. {:02x?}",

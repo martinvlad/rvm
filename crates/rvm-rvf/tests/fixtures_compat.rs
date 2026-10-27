@@ -96,3 +96,27 @@ fn legacy_rvstore_dialect_is_rejected_with_a_clear_error() {
     assert!(!format!("{err}").is_empty());
     assert!(verify(LEGACY, &VerifyOptions::default()).is_err());
 }
+
+/// ADR-354 item 6: byte fixtures shared with RuVector. The two that end in a
+/// `RVM0` page must have it split off as a *valid* Level-0 page (magic,
+/// version, CRC32C), and the dialect file must tile at 64-byte strides.
+#[test]
+fn the_shared_ruvector_byte_fixtures_walk() {
+    let dialect = include_bytes!("vectors/runtime_wire_dialect.rvf");
+    let signed = include_bytes!("vectors/runtime_signed_wire.rvf");
+    let forge = include_bytes!("vectors/forge_signed_rvm0.rvf");
+    let w = walk_container(dialect).expect("runtime wire dialect walks");
+    assert!(w.root_page.is_none());
+    assert!(w.segments.iter().all(|s| s.offset % 64 == 0));
+    for (name, bytes) in [
+        ("runtime_signed_wire", &signed[..]),
+        ("forge_signed_rvm0", &forge[..]),
+    ] {
+        let w = walk_container(bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let page = w
+            .root_page
+            .unwrap_or_else(|| panic!("{name}: no page split off"));
+        assert!(rvm_rvf::is_level0_page(&bytes[page.clone()]), "{name}");
+        assert_eq!(page.end, bytes.len());
+    }
+}

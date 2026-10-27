@@ -3,7 +3,7 @@
 use crate::error::{LaunchError, LaunchResult};
 use crate::instance::Instance;
 use crate::state::LifecycleOp;
-use crate::stream_module::VerifiedModule;
+use crate::stream_module::{StreamOrigin, VerifiedModule};
 use crate::witness::{emit, LaunchEvent};
 use rvm_host::HostAdapter;
 use rvm_types::fnv1a_32;
@@ -41,7 +41,7 @@ impl<A: HostAdapter> Instance<A> {
     ) -> LaunchResult<()> {
         self.guard(LifecycleOp::Start, log, timestamp_ns)?;
         let start = log.total_emitted();
-        let (bytes, _executable, rvf_identity, descriptor_hash) = module.into_bytes();
+        let (bytes, _executable, rvf_identity, origin) = module.into_parts();
 
         if rvf_identity != *self.package.identity() {
             return Err(self.refuse_module(&bytes, log, timestamp_ns, start));
@@ -57,7 +57,7 @@ impl<A: HostAdapter> Instance<A> {
         self.state = crate::state::InstanceState::Running;
         let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
         self.module = Some(bytes);
-        self.stream_origin = Some(descriptor_hash);
+        self.stream_origin = Some(origin);
         emit(
             log,
             LaunchEvent::InstanceStarted,
@@ -76,10 +76,10 @@ impl<A: HostAdapter> Instance<A> {
         self.module.as_deref()
     }
 
-    /// The hash of the signed stream descriptor this instance was started
+    /// The stream session and signed descriptor this instance was started
     /// from, when it was started through [`Self::start_verified`].
     #[must_use]
-    pub const fn stream_origin(&self) -> Option<&[u8; 32]> {
+    pub const fn stream_origin(&self) -> Option<&StreamOrigin> {
         self.stream_origin.as_ref()
     }
 

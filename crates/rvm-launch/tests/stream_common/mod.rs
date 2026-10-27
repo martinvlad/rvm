@@ -60,7 +60,7 @@ pub struct Streamed<'k> {
 }
 
 pub fn stream<'k>(keys: &'k [[u8; 32]], bundle: StreamBundle, base: ModulePolicy) -> Streamed<'k> {
-    let mut policy = StreamPolicy::new(keys);
+    let mut policy = StreamPolicy::unpinned_insecure(keys);
     policy.size = rvm_rvf::SizePolicy::permissive();
     policy.size.max_segments = 4096;
     Streamed {
@@ -74,4 +74,15 @@ pub fn run_all(s: &mut Streamed<'_>) -> Result<(), SessionError> {
         s.session.push(f)?;
     }
     Ok(())
+}
+
+/// Re-read the persisted `body` to confirm an `Unverifiable` identity.
+pub fn confirm(s: &mut Streamed<'_>, body: &[u8]) {
+    s.session
+        .finish_identity(|off, buf| {
+            let at = off as usize;
+            buf.copy_from_slice(&body[at..at + buf.len()]);
+            true
+        })
+        .expect("identity confirms");
 }

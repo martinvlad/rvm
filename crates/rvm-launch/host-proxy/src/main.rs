@@ -110,7 +110,7 @@ fn stream_once(order: Order, rate: Option<f64>, body: &[u8]) -> Times {
     };
     let bundle = b.build(body).unwrap();
     let keys = [b.public_key()];
-    let mut policy = StreamPolicy::new(&keys);
+    let mut policy = StreamPolicy::unpinned_insecure(&keys);
     policy.size = SizePolicy::permissive();
     policy.size.max_segments = 4096;
     let opts = VerifyOptions::with_trusted_keys(vec![kp().public])

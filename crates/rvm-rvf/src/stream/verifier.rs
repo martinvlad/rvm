@@ -56,12 +56,15 @@ pub struct StreamVerifier<'p> {
     pub(super) faults: u32,
     pub(super) verified_bytes: u64,
     pub(super) released_chunks: u64,
-    pub(super) pending_table_bytes: u64,
+    pub(super) table_bytes: u64,
     pub(super) identity: Option<IdentityTracker>,
     pub(super) identity_status: Option<IdentityStatus>,
     pub(super) max_chunk_len: u64,
     pub(super) max_table_payload: u64,
     pub(super) poison_info: Option<PoisonInfo>,
+    pub(super) last_fault: Option<PoisonInfo>,
+    pub(super) duplicates_ignored: u64,
+    pub(super) duplicate_cap: u64,
 }
 
 fn rd32(b: &[u8], o: usize) -> u32 {
@@ -87,12 +90,15 @@ impl<'p> StreamVerifier<'p> {
             faults: 0,
             verified_bytes: 0,
             released_chunks: 0,
-            pending_table_bytes: 0,
+            table_bytes: 0,
             identity: None,
             identity_status: None,
             max_chunk_len: 0,
             max_table_payload: 0,
             poison_info: None,
+            last_fault: None,
+            duplicates_ignored: 0,
+            duplicate_cap: 0,
         }
     }
 
@@ -150,6 +156,19 @@ impl<'p> StreamVerifier<'p> {
         self.poison_info
     }
 
+    /// The most recent counted fault (a refused frame that did not poison the
+    /// stream, or the one that did).
+    #[must_use]
+    pub const fn last_fault(&self) -> Option<PoisonInfo> {
+        self.last_fault
+    }
+
+    /// Duplicate frames ignored so far.
+    #[must_use]
+    pub const fn duplicates_ignored(&self) -> u64 {
+        self.duplicates_ignored
+    }
+
     /// The next chunk index expected for a segment; `None` when the segment is
     /// unknown or already verified.
     #[must_use]
@@ -203,17 +222,33 @@ impl<'p> StreamVerifier<'p> {
         seg: Option<u64>,
         chunk: u32,
     ) -> StreamError {
-        if !matches!(self.state, StreamState::Rejected(_)) {
-            self.state = StreamState::Poisoned(reason);
-            if self.poison_info.is_none() {
-                self.poison_info = Some(PoisonInfo {
-                    seg_id: seg,
-                    chunk_index: chunk,
-                    reason,
-                });
-            }
+        // Terminal states are never turned into `Poisoned` by a late frame or
+        // a reader-level size lie: a completed stream stays completed, and the
+        // offending bytes are refused with `BadState` by the caller.
+        if !matches!(
+            self.state,
+            StreamState::Rejected(_)
+                | StreamState::Complete
+                | StreamState::CompleteUnverified
+                | StreamState::Suspended
+        ) {
+            self.force_poison(reason, seg, chunk);
         }
         reason
+    }
+
+    /// Poison regardless of state, for the two callers that revoke a stream
+    /// that had completed: admission refusing a package, and a failed
+    /// `finish_identity`.
+    pub(crate) fn force_poison(&mut self, reason: StreamError, seg: Option<u64>, chunk: u32) {
+        self.state = StreamState::Poisoned(reason);
+        if self.poison_info.is_none() {
+            self.poison_info = Some(PoisonInfo {
+                seg_id: seg,
+                chunk_index: chunk,
+                reason,
+            });
+        }
     }
 
     pub(super) fn fault(
@@ -222,6 +257,11 @@ impl<'p> StreamVerifier<'p> {
         seg: Option<u64>,
         chunk: u32,
     ) -> StreamError {
+        self.last_fault = Some(PoisonInfo {
+            seg_id: seg,
+            chunk_index: chunk,
+            reason,
+        });
         self.faults += 1;
         if self.faults > self.policy.fault_budget {
             self.poison_at(reason, seg, chunk);
@@ -274,6 +314,11 @@ impl<'p> StreamVerifier<'p> {
                 self.max_table_payload = self.max_table_payload.max(32 * u64::from(n));
             }
         }
+        let total_chunks: u64 = self.segs.iter().map(|s| u64::from(s.n)).sum();
+        self.duplicate_cap = self
+            .policy
+            .max_duplicate_frames
+            .unwrap_or(4 * total_chunks + 64);
         self.left = d.entries.len();
         if h.flags & FLAG_IDENTITY_PRESENT != 0 {
             self.identity = Some(IdentityTracker {
@@ -316,12 +361,38 @@ impl<'p> StreamVerifier<'p> {
         let result = match frame.first() {
             Some(&FRAME_CHUNK) => self.on_chunk(frame),
             Some(&FRAME_CHUNK_TABLE) => self.on_table(frame),
+            Some(&FRAME_DESCRIPTOR) => self.on_descriptor_again(frame),
             _ => Err(self.fault(StreamError::UnexpectedFrame, None, 0)),
         };
         if result.is_ok() && self.state == StreamState::Ready {
             self.state = StreamState::Receiving;
         }
         result
+    }
+
+    /// Count an exact repeat of something already verified against the cap.
+    pub(super) fn count_duplicate(&mut self, seg_id: u64, chunk_index: u32) -> StreamResult<()> {
+        self.duplicates_ignored = self.duplicates_ignored.saturating_add(1);
+        if self.duplicates_ignored > self.duplicate_cap {
+            return Err(self.poison_at(StreamError::DuplicateFlood, Some(seg_id), chunk_index));
+        }
+        Ok(())
+    }
+
+    /// A descriptor frame after admission: ignored if byte-identical, a
+    /// counted fault if it differs.
+    fn on_descriptor_again<'a>(&mut self, f: &'a [u8]) -> StreamResult<Event<'a>> {
+        if f.len() < 5 || rd32(f, 1) as usize != f.len() - 5 {
+            return Err(self.poison(StreamError::FrameSizeLie));
+        }
+        let same = f.len() - 5 <= self.policy.max_descriptor_bytes
+            && super::commit::descriptor_hash(&f[5..])
+                == self.desc.as_ref().expect("installed").descriptor_hash;
+        if !same {
+            return Err(self.fault(StreamError::UnexpectedFrame, None, 0));
+        }
+        self.count_duplicate(0, 0)?;
+        Ok(Event::DuplicateDescriptor)
     }
 
     fn on_table<'a>(&mut self, f: &'a [u8]) -> StreamResult<Event<'a>> {
@@ -346,16 +417,15 @@ impl<'p> StreamVerifier<'p> {
             let d = self.desc.as_ref().expect("descriptor installed");
             (d.header.file_id, d.entries[i].chunk_table_hash)
         };
+        if self.table_bytes + (f.len() as u64 - 13) > self.policy.max_table_bytes {
+            return Err(self.fault(StreamError::LimitExceeded, Some(seg_id), 0));
+        }
         let ok = chunk_list_hash_flat(&file_id, seg_id, &f[13..])
             .is_some_and(|h| bool::from(h.ct_eq(&want)));
         if !ok {
             return Err(self.fault(StreamError::TableHashMismatch, Some(seg_id), 0));
         }
-        let bytes = f.len() as u64 - 13;
-        if self.pending_table_bytes + bytes > self.policy.max_pending_table_bytes {
-            return Err(self.poison_at(StreamError::LimitExceeded, Some(seg_id), 0));
-        }
-        self.pending_table_bytes += bytes;
+        self.table_bytes += f.len() as u64 - 13;
         self.segs[i].leaves = Some(f[13..].to_vec());
         Ok(Event::TableVerified { seg_id })
     }
@@ -378,7 +448,7 @@ impl<'p> StreamVerifier<'p> {
         &mut self,
         mut read_at: impl FnMut(u64, &mut [u8]) -> bool,
     ) -> StreamResult<()> {
-        if self.state != StreamState::Complete
+        if self.state != StreamState::CompleteUnverified
             || self.identity_status != Some(IdentityStatus::Unverifiable)
         {
             return Err(StreamError::BadState);
@@ -397,9 +467,12 @@ impl<'p> StreamVerifier<'p> {
         }
         let got: [u8; 32] = hasher.finalize().into();
         if !bool::from(got.ct_eq(&h.rvf_identity)) {
-            return Err(self.poison_at(StreamError::IdentityMismatch, None, 0));
+            // Explicit retroactive revocation of an unconfirmed artifact.
+            self.force_poison(StreamError::IdentityMismatch, None, 0);
+            return Err(StreamError::IdentityMismatch);
         }
         self.identity_status = Some(IdentityStatus::Verified);
+        self.state = StreamState::Complete;
         Ok(())
     }
 }

@@ -57,6 +57,8 @@ pub enum CheckKind {
     StreamComplete = 11,
     /// A streamed executable module passed or failed incremental validation.
     StreamModule = 12,
+    /// A stream frame was refused and counted against the fault budget.
+    StreamFault = 13,
 }
 
 /// The result of one check.
@@ -214,7 +216,17 @@ pub struct VerifyOptions {
     /// loading a stream-profiled package from a whole buffer skips the
     /// per-chunk commitments its publisher chose, so it needs explicit,
     /// signed-policy permission (ADR-160 item 7).
+    ///
+    /// The permission only takes effect together with a pinned
+    /// [`Self::expected_identity`]: a stream-profiled package that arrives as an
+    /// unpinned buffer is unauthenticated as to what it is.
     pub permit_buffered_stream_profile: bool,
+    /// Refuse a whole-buffer package unless [`Self::expected_identity`] pins
+    /// it. Set by a host whose policy says packages are stream-delivered (or
+    /// that holds a descriptor for this one): the unsigned `META` line that
+    /// declares a stream profile can be stripped by anyone who can change the
+    /// bytes, and only the pin ties the buffer to the signed descriptor.
+    pub require_pinned_identity: bool,
 }
 
 impl VerifyOptions {

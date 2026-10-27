@@ -115,6 +115,17 @@ pub fn corpus() -> Vec<(&'static str, Vec<u8>)> {
         v.push(("zero-tail", d));
     }
     {
+        // RF-01: four payload bytes that spell the root magic where a page would
+        // end must not move the segment boundary on either path.
+        let mut body = unsigned_segment(SEG_MANIFEST, b"root", 1);
+        let first = body.len();
+        let mut payload = noise(8_000, 77);
+        let at = (first + 64 + 8_000 - 4096) - (first + 64);
+        payload[at..at + 4].copy_from_slice(&rvm_rvf::ROOT_PAGE_MAGIC.to_le_bytes());
+        body.extend(unsigned_segment(SEG_META, &payload, 2));
+        v.push(("rvm0-magic-inside-a-payload", body));
+    }
+    {
         let mut d = good_body();
         d.extend(unsigned_segment(
             SEG_META,
@@ -136,7 +147,7 @@ pub struct Run {
 
 /// Push every frame of `bundle` through a fresh admission.
 pub fn run_bundle(bundle: &StreamBundle, keys: &[[u8; 32]], opts: &VerifyOptions) -> Run {
-    let mut policy = StreamPolicy::new(keys);
+    let mut policy = StreamPolicy::unpinned_insecure(keys);
     policy.size = opts.size_policy;
     let mut adm = StreamAdmission::new(policy, opts.clone());
     let mut first_error = None;

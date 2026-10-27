@@ -135,9 +135,10 @@ impl FrameReader {
         while !data.is_empty() {
             match v.state() {
                 StreamState::Poisoned(_) => return Err(StreamError::Poisoned),
-                StreamState::Rejected(_) | StreamState::Complete | StreamState::Suspended => {
-                    return Err(StreamError::BadState)
-                }
+                StreamState::Rejected(_)
+                | StreamState::Complete
+                | StreamState::CompleteUnverified
+                | StreamState::Suspended => return Err(StreamError::BadState),
                 _ => {}
             }
             if self.buf.is_empty() {

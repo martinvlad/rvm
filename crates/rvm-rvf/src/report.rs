@@ -96,13 +96,15 @@ pub(crate) struct Declarations<'a> {
 /// `rvf_identity`, which covers this very `META` line.
 pub const STREAM_PROFILE_DECLARATION_KEY: &str = "rvm.stream_profile";
 
+/// Whether any line of any plaintext `META` payload starts with the
+/// declaration key followed by `=`. Read as bytes, so a payload that is not
+/// valid UTF-8 (trailing junk, a stray byte) cannot hide the line.
 fn declares_stream_profile<'a>(mut payloads: impl Iterator<Item = &'a [u8]>) -> bool {
+    let key = STREAM_PROFILE_DECLARATION_KEY.as_bytes();
     payloads.any(|p| {
-        core::str::from_utf8(p).is_ok_and(|text| {
-            text.lines().any(|line| {
-                line.strip_prefix(STREAM_PROFILE_DECLARATION_KEY)
-                    .is_some_and(|rest| rest.starts_with('='))
-            })
+        p.split(|&b| b == b'\n').any(|line| {
+            line.strip_prefix(key)
+                .is_some_and(|rest| rest.first() == Some(&b'='))
         })
     })
 }
@@ -176,6 +178,19 @@ fn segment_record(
 pub(crate) fn build_report(input: &ReportInput<'_>, opts: &VerifyOptions) -> VerificationReport {
     let mut records = Vec::new();
     let segments = input.segments;
+
+    if opts.require_pinned_identity
+        && opts.expected_identity.is_none()
+        && input.delivery == Delivery::Buffered
+    {
+        // A whole buffer carries no authentication of its own; without a pin
+        // the host has nothing to say the bytes are the package it meant.
+        records.push(container_record(
+            CheckKind::Identity,
+            Outcome::Fail,
+            DetailCode::IdentityNotPinned,
+        ));
+    }
 
     if let Some(expected) = opts.expected_identity {
         let matches = expected == input.identity;
@@ -313,7 +328,9 @@ fn capability_record(meta: &Declarations<'_>) -> (CapabilityMapping, Verificatio
 fn stream_profile_record(delivery: Delivery, opts: &VerifyOptions) -> VerificationRecord {
     let (outcome, detail) = match delivery {
         Delivery::Streamed => (Outcome::Pass, DetailCode::StreamProfileSatisfied),
-        Delivery::Buffered if opts.permit_buffered_stream_profile => {
+        Delivery::Buffered
+            if opts.permit_buffered_stream_profile && opts.expected_identity.is_some() =>
+        {
             (Outcome::Pass, DetailCode::StreamProfilePermitted)
         }
         Delivery::Buffered => (Outcome::Fail, DetailCode::StreamProfileDowngrade),

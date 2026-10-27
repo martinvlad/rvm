@@ -10,6 +10,9 @@
 //! Properties: never panics; never allocates beyond the policy bound (the
 //! decoder checks lengths before allocating); an accepted descriptor satisfies
 //! the invariants it promises.
+//!
+//! Seeds (derived from the shared vectors, regenerate with the ignored test
+//! `write_fuzz_seeds`): `cargo +nightly fuzz run descriptor_decode corpus/descriptor_decode seeds/descriptor_decode`.
 #![no_main]
 
 use ed25519_dalek::{Signer, SigningKey};
@@ -19,7 +22,7 @@ use rvm_rvf::stream::{decode_descriptor, signed_message, StreamPolicy, ENTRY_SIZ
 const SEED: [u8; 32] = [0x2a; 32];
 
 fn check(bytes: &[u8], keys: &[[u8; 32]]) {
-    let policy = StreamPolicy::new(keys);
+    let policy = StreamPolicy::unpinned_insecure(keys);
     if let Ok(d) = decode_descriptor(bytes, &policy) {
         // Everything an accepted descriptor promises.
         assert_eq!(d.entries.len(), d.header.seg_count as usize);

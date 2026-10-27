@@ -11,15 +11,15 @@ use rvm_rvf::stream::{
     signed_message, FrameReader, StreamAdmission, StreamPolicy, StreamState, HEADER_SIZE,
 };
 use rvm_rvf::testkit::{unsigned_segment, unsigned_segment_with};
-use rvm_rvf::{verify, RvfError, ROOT_PAGE_MAGIC};
+use rvm_rvf::{verify, ROOT_PAGE_MAGIC};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 /// RF-01: a body whose last 4096 bytes start, inside a META payload, with the
-/// root-page magic. The signed descriptor cuts it correctly into two ordinary
-/// segments and the stream completes; the buffered walk mistakes the tail of
-/// the payload for a Level-0 page and refuses the same bytes.
+/// root-page magic. The magic alone no longer makes a page: the buffered walk
+/// needs a structurally valid Level-0 page (version, CRC32C), so both paths
+/// cut the body into the same two segments and agree.
 #[test]
-fn rf01_rvm0_inside_a_payload_splits_stream_and_buffered_verdicts() {
+fn rf01_rvm0_inside_a_payload_no_longer_splits_the_verdicts() {
     let mut body = unsigned_segment(0x05, b"root", 1); // 128 bytes
     let first_len = body.len();
     let mut payload = noise(8_000, 77);
@@ -30,41 +30,124 @@ fn rf01_rvm0_inside_a_payload_splits_stream_and_buffered_verdicts() {
     body.extend(unsigned_segment(0x07, &payload, 2));
     assert_eq!(body.len(), total);
 
-    // Buffered: refused as a structural error (tail of the payload is "the page").
-    assert_eq!(verify(&body, &opts()).unwrap_err(), RvfError::PayloadOutOfBounds);
+    let buffered = verify(&body, &opts()).expect("the buffered walk accepts it now");
 
-    // Stream: descriptor committed to the true segment boundaries.
     let b = builder(12, Order::File);
     let spans = [
-        Span { seg_id: 1, seg_type: 0x05, start: 0, end: first_len, uncompressed: 0 },
-        Span { seg_id: 2, seg_type: 0x07, start: first_len, end: total, uncompressed: 0 },
+        Span {
+            seg_id: 1,
+            seg_type: 0x05,
+            start: 0,
+            end: first_len,
+            uncompressed: 0,
+        },
+        Span {
+            seg_id: 2,
+            seg_type: 0x07,
+            start: first_len,
+            end: total,
+            uncompressed: 0,
+        },
     ];
     let bundle = b.build_spans(&body, &spans);
     let keys = [b.public_key()];
     let run = run_bundle(&bundle, &keys, &opts());
     assert_eq!(run.state, StreamState::Complete, "{:?}", run.first_error);
-    assert!(run.report.is_some(), "stream admitted what verify() refuses");
+    assert_eq!(
+        run.report.unwrap(),
+        buffered,
+        "one verdict, record for record"
+    );
 }
 
-/// RF-02: calling the public `discard_derived_state` on a live (not poisoned)
-/// admission makes the next completing segment index an emptied vector.
+/// RF-01 (other direction): a stream may not call arbitrary bytes a root page.
 #[test]
-fn rf02_discard_derived_state_on_a_live_stream_panics_later() {
+fn rf01_a_pseudo_entry_that_is_not_a_level0_page_is_refused() {
+    let mut body = unsigned_segment(0x05, b"root", 1);
+    let first_len = body.len();
+    body.extend(vec![0u8; 4096]); // zeros: no magic, no CRC
+    let b = builder(12, Order::File);
+    let spans = [
+        Span {
+            seg_id: 1,
+            seg_type: 0x05,
+            start: 0,
+            end: first_len,
+            uncompressed: 0,
+        },
+        Span {
+            seg_id: u64::MAX,
+            seg_type: 0xFE,
+            start: first_len,
+            end: body.len(),
+            uncompressed: 0,
+        },
+    ];
+    let bundle = b.build_spans(&body, &spans);
+    let keys = [b.public_key()];
+    let run = run_bundle(&bundle, &keys, &opts());
+    assert_ne!(run.state, StreamState::Complete);
+    assert!(run.report.is_none());
+}
+
+/// RF-02: `discard_derived_state` on a live stream now poisons it instead of
+/// leaving a later panic.
+#[test]
+fn rf02_discard_derived_state_on_a_live_stream_poisons_and_never_panics() {
     let body = small_body();
     let b = builder(0xFF, Order::File);
     let bundle = b.build(&body).unwrap();
     let keys = [b.public_key()];
-    let mut policy = StreamPolicy::new(&keys);
+    let mut policy = StreamPolicy::unpinned_insecure(&keys);
     policy.size = opts().size_policy;
     let mut adm = StreamAdmission::new(policy, opts());
     adm.push(&bundle.frames[0]).unwrap();
     adm.discard_derived_state();
+    assert!(matches!(adm.state(), StreamState::Poisoned(_)));
     let r = catch_unwind(AssertUnwindSafe(|| {
         for f in &bundle.frames[1..] {
-            let _ = adm.push(f);
+            assert!(adm.push(f).is_err());
         }
     }));
-    assert!(r.is_err(), "expected an index-out-of-bounds panic");
+    assert!(r.is_ok(), "no panic after the discard");
+}
+
+/// RF-03: a segment header may not claim a larger `uncompressed_len` than the
+/// signed entry bounds.
+#[test]
+fn rf03_header_uncompressed_len_above_the_signed_entry_is_refused() {
+    let mut body = small_body();
+    // Segment 3 (vectors): header offset 0x38 is uncompressed_len (u32).
+    let seg = rvm_rvf::walk(&body).unwrap()[2].offset;
+    body[seg + 0x38..seg + 0x3C].copy_from_slice(&5_000u32.to_le_bytes());
+    let b = builder(12, Order::File);
+    let w = rvm_rvf::walk(&body).unwrap();
+    let spans: Vec<Span> = w
+        .iter()
+        .enumerate()
+        .map(|(i, s)| Span {
+            seg_id: s.header.segment_id,
+            seg_type: s.header.seg_type,
+            start: s.offset,
+            end: w.get(i + 1).map_or(body.len(), |n| n.offset),
+            uncompressed: 0, // the signed bound: zero
+        })
+        .collect();
+    let bundle = b.build_spans(&body, &spans);
+    let keys = [b.public_key()];
+    let run = run_bundle(&bundle, &keys, &opts());
+    assert_ne!(run.state, StreamState::Complete);
+    assert!(run.report.is_none());
+    // With the bound signed, the same bytes are admitted.
+    let spans: Vec<Span> = spans
+        .into_iter()
+        .map(|s| Span {
+            uncompressed: if s.seg_id == 3 { 5_000 } else { 0 },
+            ..s
+        })
+        .collect();
+    let run = run_bundle(&b.build_spans(&body, &spans), &keys, &opts());
+    assert_eq!(run.state, StreamState::Complete, "{:?}", run.first_error);
 }
 
 struct Rng(u64);
@@ -81,7 +164,7 @@ impl Rng {
 }
 
 fn drive(frames: &[Vec<u8>], keys: &[[u8; 32]]) {
-    let mut policy = StreamPolicy::new(keys);
+    let mut policy = StreamPolicy::unpinned_insecure(keys);
     policy.size = opts().size_policy;
     let mut adm = StreamAdmission::new(policy, opts());
     for f in frames {
@@ -90,7 +173,7 @@ fn drive(frames: &[Vec<u8>], keys: &[[u8; 32]]) {
 }
 
 fn drive_reader(frames: &[Vec<u8>], keys: &[[u8; 32]], rng: &mut Rng) {
-    let mut policy = StreamPolicy::new(keys);
+    let mut policy = StreamPolicy::unpinned_insecure(keys);
     policy.size = opts().size_policy;
     let mut adm = StreamAdmission::new(policy, opts());
     let all: Vec<u8> = frames.concat();

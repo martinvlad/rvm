@@ -51,10 +51,21 @@ pub enum StreamError {
     WeakChecksum = 0x0816,
     /// The stream is poisoned and accepts nothing.
     Poisoned = 0x0817,
-    /// The fault budget is exhausted.
-    FaultBudgetExceeded = 0x0818,
     /// A frame was pushed in a state that cannot accept it.
     BadState = 0x0819,
+    /// More duplicate frames than the policy allows.
+    DuplicateFlood = 0x081A,
+    // ---- RVM-local codes (not in RuVector's `ErrorCode`): 0x0F00.. ----
+    /// A released segment is not a well-formed RVF segment (ADR-155 structure).
+    SegmentMalformed = 0x0F00,
+    /// A segment header contradicts its signed table entry.
+    SegmentMismatch = 0x0F01,
+    /// Admission needs `rvf_identity` and the descriptor carries none.
+    IdentityRequired = 0x0F02,
+    /// More segments were open at once than policy allows.
+    TooManyOpenSegments = 0x0F03,
+    /// The descriptor sets `expires_ns` and the policy has no trusted clock.
+    ClockRequired = 0x0F04,
 }
 
 impl StreamError {
@@ -89,8 +100,13 @@ impl StreamError {
             Self::IdentityMismatch => "StreamIdentityMismatch",
             Self::WeakChecksum => "StreamWeakChecksum",
             Self::Poisoned => "StreamPoisoned",
-            Self::FaultBudgetExceeded => "StreamFaultBudgetExceeded",
             Self::BadState => "StreamBadState",
+            Self::DuplicateFlood => "StreamDuplicateFlood",
+            Self::SegmentMalformed => "RvmSegmentMalformed",
+            Self::SegmentMismatch => "RvmSegmentMismatch",
+            Self::IdentityRequired => "RvmIdentityRequired",
+            Self::TooManyOpenSegments => "RvmTooManyOpenSegments",
+            Self::ClockRequired => "RvmClockRequired",
         }
     }
 }
@@ -104,7 +120,9 @@ impl fmt::Display for StreamError {
 impl From<StreamError> for RvmError {
     fn from(e: StreamError) -> Self {
         match e {
-            StreamError::LimitExceeded => RvmError::ResourceLimitExceeded,
+            StreamError::LimitExceeded | StreamError::TooManyOpenSegments => {
+                RvmError::ResourceLimitExceeded
+            }
             StreamError::UnsupportedVersion | StreamError::BadFlags => RvmError::Unsupported,
             _ => RvmError::ProofInvalid,
         }
