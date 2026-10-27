@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-rvm-rvf = { path = "..", features = ["testkit", "std"] }
+rvm-rvf = { path = "..", features = ["testkit", "std", "parallel-identity"] }
 rvm-launch = { path = "../../rvm-launch", features = ["std"] }
 rvm-wasm = { path = "../../rvm-wasm", features = ["std"] }
 ed25519-dalek = { version = "=2.1.1", default-features = false }
@@ -33,5 +33,11 @@ doc = false
 [[bin]]
 name = "admission_session"
 path = "fuzz_targets/admission_session.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "identity_worker"
+path = "fuzz_targets/identity_worker.rs"
 test = false
 doc = false
