@@ -337,7 +337,7 @@ fn p5_replay_of_an_older_or_conflicting_descriptor() {
         descriptor_hash: accepted.descriptor_hash,
         signer_key_id: accepted.header.signer_key_id,
     };
-    let lookup = move |_: &[u8; 16]| Some(pin);
+    let lookup = move |sg: &[u8; 8], _: &[u8; 16]| Some(pin).filter(|p| &p.signer_key_id == sg);
     for (bundle, want) in [
         (&old, Some(StreamError::StaleEpoch)),
         (&other, Some(StreamError::EpochConflict)),

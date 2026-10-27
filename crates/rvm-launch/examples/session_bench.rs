@@ -271,8 +271,27 @@ fn gbps(bytes: usize, secs: f64) -> f64 {
     bytes as f64 / secs / 1e9
 }
 
-fn best_of<F: FnMut() -> f64>(n: usize, mut f: F) -> f64 {
-    (0..n).map(|_| f()).fold(0.0_f64, f64::max)
+/// Median of `n` runs; the spread is printed by [`fmt`].
+fn best_of<F: FnMut() -> f64>(n: usize, mut f: F) -> Stat {
+    let mut v: Vec<f64> = (0..n).map(|_| f()).collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    Stat {
+        median: v[v.len() / 2],
+        min: v[0],
+        max: v[v.len() - 1],
+    }
+}
+
+struct Stat {
+    median: f64,
+    min: f64,
+    max: f64,
+}
+
+impl std::fmt::Display for Stat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:>5.2} [{:.2}-{:.2}]", self.median, self.min, self.max)
+    }
 }
 
 fn b4() {
@@ -283,11 +302,11 @@ fn b4() {
     let total = 256usize << 20;
     let body = body(total, 8);
     println!(
-        "body: {} MiB, release build, best of 5, in-memory frames (no I/O)",
+        "body: {} MiB, release build, median [min-max] of 7, in-memory frames (no I/O)",
         body.len() >> 20
     );
     let o = opts();
-    let buffered = best_of(5, || {
+    let buffered = best_of(7, || {
         let t = Instant::now();
         let r = verify(&body, &o).unwrap();
         assert!(r.ok);
@@ -306,7 +325,7 @@ fn b4() {
         let b = builder(chunk_log2);
         let bundle = b.build(&body).unwrap();
         let keys = [b.public_key()];
-        let verifier = best_of(5, || {
+        let verifier = best_of(7, || {
             let mut v = StreamVerifier::new(policy(&keys));
             let t = Instant::now();
             for f in &bundle.frames {
@@ -314,7 +333,7 @@ fn b4() {
             }
             gbps(body.len(), t.elapsed().as_secs_f64())
         });
-        let admission = best_of(5, || {
+        let admission = best_of(7, || {
             let mut a = StreamAdmission::new(policy(&keys), o.clone());
             let t = Instant::now();
             for f in &bundle.frames {
@@ -323,7 +342,7 @@ fn b4() {
             assert!(a.report().unwrap().ok);
             gbps(body.len(), t.elapsed().as_secs_f64())
         });
-        let session = best_of(3, || {
+        let session = best_of(7, || {
             let base = ModulePolicy {
                 imports: ImportPolicy::AllowAll,
                 ..ModulePolicy::default()
@@ -336,7 +355,7 @@ fn b4() {
             gbps(body.len(), t.elapsed().as_secs_f64())
         });
         println!(
-            "{label:<44} verifier {verifier:>6.2}  admission {admission:>6.2}  session(+wasm validate) {session:>6.2}  GB/s   descriptor {} B ({:.4}% of body)",
+            "{label:<44} verifier {verifier}  admission {admission}  session {session}  GB/s   descriptor {} B ({:.4}% of body)",
             bundle.descriptor.len(),
             bundle.descriptor.len() as f64 * 100.0 / body.len() as f64
         );
@@ -346,7 +365,7 @@ fn b4() {
     b.identity = false;
     let bundle = b.build(&body).unwrap();
     let keys = [b.public_key()];
-    let no_identity = best_of(5, || {
+    let no_identity = best_of(7, || {
         let mut v = StreamVerifier::new(policy(&keys));
         let t = Instant::now();
         for f in &bundle.frames {
@@ -355,10 +374,53 @@ fn b4() {
         gbps(body.len(), t.elapsed().as_secs_f64())
     });
     println!(
-        "{:<44} verifier {no_identity:>6.2} GB/s  (descriptor does not commit to rvf_identity)",
+        "{:<44} verifier {no_identity} GB/s  (descriptor does not commit to rvf_identity)",
         "64 KiB chunks, no identity pass"
     );
     let _ = std::io::stdout().flush();
+}
+
+/// Cost of `finish_identity` (round-2 chunk-wise re-verification) on a 256 MiB
+/// persisted body served from memory: time per call, and the read count.
+fn fin() {
+    println!(
+        "finish_identity, 256 MiB persisted body. load average: {}",
+        load_avg()
+    );
+    let body = body(256usize << 20, 8);
+    let mut b = builder(16);
+    b.order = Order::Stage;
+    b.stages = Stages::ByType;
+    let bundle = b.build(&body).unwrap();
+    let keys = [b.public_key()];
+    let o = opts();
+    let base = ModulePolicy {
+        imports: ImportPolicy::AllowAll,
+        ..ModulePolicy::default()
+    };
+    let (mut times, mut reads) = (Vec::new(), 0u64);
+    for _ in 0..7 {
+        let mut s = StreamSession::new(policy(&keys), o.clone(), base.clone());
+        for f in &bundle.frames {
+            s.push(f).unwrap();
+        }
+        let mut n = 0u64;
+        let t = Instant::now();
+        s.finish_identity(|off, buf| {
+            n += 1;
+            let at = off as usize;
+            buf.copy_from_slice(&body[at..at + buf.len()]);
+            true
+        })
+        .unwrap();
+        times.push(gbps(body.len(), t.elapsed().as_secs_f64()));
+        reads = n;
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    println!(
+        "finish_identity {:.2} GB/s [{:.2}-{:.2}] median of 7, {} read_at calls",
+        times[3], times[0], times[6], reads
+    );
 }
 
 fn main() {
@@ -366,6 +428,7 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("b3") => b3(),
         Some("b4") => b4(),
+        Some("fin") => fin(),
         Some("prepare") => {
             let n = |i: usize| args[i].parse::<usize>().unwrap();
             prepare(

@@ -44,12 +44,14 @@
 #![allow(clippy::many_single_char_names)]
 
 mod admission;
+mod buffered;
 mod chunk;
 mod commit;
 mod descriptor;
 mod error;
 mod events;
 mod frame;
+mod ident;
 mod pin;
 mod segment;
 mod verifier;
@@ -59,6 +61,7 @@ pub mod witness;
 pub mod builder;
 
 pub use admission::{AdmissionError, AdmissionEvent, StreamAdmission};
+pub use buffered::verify_with_descriptor;
 pub use commit::{
     chunk_list_hash, chunk_list_hash_flat, descriptor_hash, leaf_hash, signed_message,
     signer_key_id, verify_descriptor_signature, LEAF_TAG, SIG_DOMAIN, SIG_LEN, TABLE_TAG,
@@ -81,7 +84,7 @@ pub use verifier::StreamVerifier;
 use crate::policy::SizePolicy;
 
 /// Epoch pin lookup by `file_id`.
-pub type EpochPinFn<'a> = dyn Fn(&[u8; 16]) -> Option<EpochPin> + 'a;
+pub type EpochPinFn<'a> = dyn Fn(&[u8; 8], &[u8; 16]) -> Option<EpochPin> + 'a;
 
 /// The highest accepted `(epoch, descriptor hash)` for one lineage: a
 /// `file_id` published by one signer.
@@ -107,7 +110,7 @@ pub enum ReplayProtection<'a> {
     Unpinned,
     /// Look pins up through a function; nothing is recorded.
     Lookup {
-        /// Pin lookup by `file_id`.
+        /// Pin lookup by `(signer_key_id, file_id)`.
         pin: &'a EpochPinFn<'a>,
         /// Trusted clock in ns. A descriptor with `expires_ns` set is refused
         /// when this is `None`.
@@ -127,11 +130,11 @@ pub enum ReplayProtection<'a> {
 impl ReplayProtection<'_> {
     /// The pin for `file_id`.
     #[must_use]
-    pub fn lookup(&self, file_id: &[u8; 16]) -> Option<EpochPin> {
+    pub fn lookup(&self, signer: &[u8; 8], file_id: &[u8; 16]) -> Option<EpochPin> {
         match self {
             Self::Unpinned => None,
-            Self::Lookup { pin, .. } => pin(file_id),
-            Self::Store { store, .. } => store.lookup(file_id),
+            Self::Lookup { pin, .. } => pin(signer, file_id),
+            Self::Store { store, .. } => store.lookup(signer, file_id),
         }
     }
 

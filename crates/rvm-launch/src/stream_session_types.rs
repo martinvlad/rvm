@@ -40,6 +40,9 @@ pub enum SessionError {
     /// The stream completed with an identity that nothing has verified
     /// (stage-ordered delivery): call `finish_identity` first.
     IdentityUnverified,
+    /// A newer or conflicting descriptor for this lineage was pinned while the
+    /// stream was in flight (replay protection re-checked at completion).
+    Replay(rvm_rvf::stream::StreamError),
     /// Installing the package's capabilities failed.
     Install(rvm_rvf::RvfError),
     /// The session failed or was poisoned earlier.
@@ -60,6 +63,7 @@ impl core::fmt::Display for SessionError {
             Self::IdentityUnverified => {
                 f.write_str("the package identity has not been verified; call finish_identity")
             }
+            Self::Replay(e) => write!(f, "replay protection: {e}"),
             Self::Install(e) => write!(f, "installing capabilities: {e}"),
             Self::Unusable => f.write_str("the session failed or was poisoned"),
         }

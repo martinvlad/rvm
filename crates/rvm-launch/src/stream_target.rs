@@ -56,9 +56,10 @@ impl<const N: usize> FrameTarget for Witnessed<'_, '_, '_, N> {
     fn poison(&mut self, reason: StreamError) -> StreamError {
         let was = self.session.admission.state();
         let e = self.session.admission.verifier_poison(reason);
-        if let Some(b) = binding_of(&self.session.admission) {
-            witness_transition(&self.session.admission, was, &b, self.log, self.ctx);
-        }
+        // Before any descriptor there is no binding: the record carries an
+        // all-zero one, which marks the poison as unauthenticated.
+        let b = binding_of(&self.session.admission).unwrap_or([0; 32]);
+        witness_transition(&self.session.admission, was, &b, self.log, self.ctx);
         e
     }
 

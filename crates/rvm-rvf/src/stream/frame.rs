@@ -164,12 +164,17 @@ impl FrameReader {
             self.buf.extend_from_slice(&data[..take]);
             data = &data[take..];
             if self.need.is_none() && self.buf.len() == target {
-                self.need = Some(Self::admit(v, &self.buf)?);
+                let total = Self::admit(v, &self.buf)?;
+                // The size is now bounded by the signed descriptor: reserve it
+                // once instead of growing by doubling.
+                self.buf.reserve_exact(total - self.buf.len());
+                self.need = Some(total);
             }
             if Some(self.buf.len()) == self.need {
-                let frame = core::mem::take(&mut self.buf);
                 self.need = None;
-                sink(v.push_frame(&frame));
+                sink(v.push_frame(&self.buf));
+                // Keep the allocation for the next frame.
+                self.buf.clear();
             }
         }
         Ok(())

@@ -16,30 +16,48 @@
 //!    exactly once, when the stream is `Complete`, its identity is `Verified`
 //!    and the package passed ADR-155 admission.
 //!
-//! A store must be monotone: [`PinStore::record`] never lowers an epoch, and at
-//! an equal epoch keeps the first descriptor hash it saw.
+//! Pins are keyed by `(signer_key_id, file_id)` and advance by compare-and-set
+//! ([`PinStore::advance`]): the session re-checks the pin when the stream
+//! completes (a session that started at epoch 4 and finished after epoch 5 was
+//! pinned is refused), then advances from the value it checked against.
 
 use super::EpochPin;
 use alloc::collections::BTreeMap;
 use core::cell::RefCell;
 
-/// Durable memory of the highest accepted `(epoch, descriptor hash)` per file.
+/// Durable memory of the highest accepted `(epoch, descriptor hash)` per
+/// lineage, where a lineage is a `(signer_key_id, file_id)` pair: a second
+/// trusted signer publishing the same `file_id` has its own pin and neither can
+/// displace or bypass the other's.
 ///
 /// Methods take `&self` so a policy can borrow the store for lookups while a
 /// session records into it; implementations use interior mutability.
 pub trait PinStore {
-    /// The pin for `file_id`, if one was recorded.
-    fn lookup(&self, file_id: &[u8; 16]) -> Option<EpochPin>;
+    /// The pin for the lineage, if one was recorded.
+    fn lookup(&self, signer: &[u8; 8], file_id: &[u8; 16]) -> Option<EpochPin>;
 
-    /// Record an admitted descriptor. Must not lower an existing epoch.
-    fn record(&self, file_id: &[u8; 16], pin: EpochPin);
+    /// Atomic compare-and-set: advance the lineage's pin to `new` only if the
+    /// current pin is exactly `expected` (`None` = none recorded), and `new` is
+    /// not older than `expected`. Returns whether it advanced. A caller that
+    /// loses the race re-reads, re-checks and retries.
+    fn advance(
+        &self,
+        signer: &[u8; 8],
+        file_id: &[u8; 16],
+        expected: Option<EpochPin>,
+        new: EpochPin,
+    ) -> bool;
 }
 
+/// `(signer_key_id, file_id)`.
+type Lineage = ([u8; 8], [u8; 16]);
+
 /// An in-process [`PinStore`]. Not durable: a restart forgets every pin, which
-/// reopens the replay window. A production host persists its store.
+/// reopens the replay window. A production host persists its store. Uses
+/// interior mutability without a lock: not for use from interrupt context.
 #[derive(Debug, Default)]
 pub struct MemoryPinStore {
-    pins: RefCell<BTreeMap<[u8; 16], EpochPin>>,
+    pins: RefCell<BTreeMap<Lineage, EpochPin>>,
 }
 
 impl MemoryPinStore {
@@ -51,7 +69,7 @@ impl MemoryPinStore {
         }
     }
 
-    /// Number of files pinned.
+    /// Number of lineages pinned.
     #[must_use]
     pub fn len(&self) -> usize {
         self.pins.borrow().len()
@@ -65,17 +83,24 @@ impl MemoryPinStore {
 }
 
 impl PinStore for MemoryPinStore {
-    fn lookup(&self, file_id: &[u8; 16]) -> Option<EpochPin> {
-        self.pins.borrow().get(file_id).copied()
+    fn lookup(&self, signer: &[u8; 8], file_id: &[u8; 16]) -> Option<EpochPin> {
+        self.pins.borrow().get(&(*signer, *file_id)).copied()
     }
 
-    fn record(&self, file_id: &[u8; 16], pin: EpochPin) {
+    fn advance(
+        &self,
+        signer: &[u8; 8],
+        file_id: &[u8; 16],
+        expected: Option<EpochPin>,
+        new: EpochPin,
+    ) -> bool {
         let mut pins = self.pins.borrow_mut();
-        match pins.get(file_id) {
-            Some(old) if old.epoch >= pin.epoch => {}
-            _ => {
-                pins.insert(*file_id, pin);
-            }
+        let key = (*signer, *file_id);
+        let current = pins.get(&key).copied();
+        if current != expected || expected.is_some_and(|e| new.epoch < e.epoch) {
+            return false;
         }
+        pins.insert(key, new);
+        true
     }
 }

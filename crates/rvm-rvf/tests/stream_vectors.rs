@@ -68,7 +68,7 @@ impl Case {
     }
 }
 
-type PinFn<'p> = &'p dyn Fn(&[u8; 16]) -> Option<EpochPin>;
+type PinFn<'p> = &'p dyn Fn(&[u8; 8], &[u8; 16]) -> Option<EpochPin>;
 
 fn run<'p>(case: &'p Case, pin: PinFn<'p>) -> StreamVerifier<'p> {
     let mut policy = StreamPolicy::unpinned_insecure(&case.keys);
@@ -195,7 +195,7 @@ fn positive_streams_produce_the_listed_events() {
             now_ns: None,
             max_duplicate_frames: None,
         };
-        let none = |_: &[u8; 16]| None;
+        let none = |_: &[u8; 8], _: &[u8; 16]| None;
         // Descriptor decode and every table entry.
         let desc_bytes = hex(stream["descriptor_hex"].as_str().unwrap());
         assert_eq!(
@@ -302,7 +302,10 @@ fn run_case(v: &Value, c: &Value) {
     let frames = apply_edits(&base, c["edits"].as_array().unwrap());
     let case = Case::from_json(&c["policy"]);
     let pin = case.pin;
-    let lookup = move |f: &[u8; 16]| pin.filter(|(id, _)| id == f).map(|(_, p)| p);
+    let lookup = move |sg: &[u8; 8], f: &[u8; 16]| {
+        pin.filter(|(id, p)| id == f && &p.signer_key_id == sg)
+            .map(|(_, p)| p)
+    };
     let mut ver = run(&case, &lookup);
     let want = &c["expect"];
     let mut first_error = None;

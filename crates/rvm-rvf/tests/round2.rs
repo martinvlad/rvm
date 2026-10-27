@@ -6,7 +6,7 @@ use common::{builder, noise, opts, run_bundle};
 use rvm_rvf::stream::builder::{Order, Span};
 use rvm_rvf::stream::StreamState;
 use rvm_rvf::testkit::{unsigned_segment, unsigned_segment_with};
-use rvm_rvf::{verify, CheckKind, DetailCode, Outcome, ROOT_PAGE_MAGIC, RvfError};
+use rvm_rvf::{verify, CheckKind, DetailCode, Outcome, ROOT_PAGE_MAGIC};
 
 fn crc32c(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
@@ -28,13 +28,13 @@ fn level0_page() -> [u8; 4096] {
     p
 }
 
-/// RF-01b DEFECT (Low-Medium, residual): the stricter page test is
-/// attacker-satisfiable. The CRC is not a secret, so anyone who controls the
-/// last 4096 payload bytes of a segment can embed a "valid" page there. The
-/// buffered walk then still cuts the body inside the segment and refuses it,
-/// while the signed table lets the stream carry it.
+/// RF-01b (fixed): a crafted valid page inside a payload. The CRC is public,
+/// so the buffered walk can be handed one; but a page that is not a real page
+/// does not sit on a segment boundary, so the split walk fails and the walk
+/// falls back to the whole buffer: both paths now cut the body the same way.
+/// With the descriptor in hand the buffered path does not guess at all.
 #[test]
-fn rf01b_a_crafted_valid_page_inside_a_payload_still_splits_the_verdicts() {
+fn rf01b_a_crafted_valid_page_inside_a_payload_no_longer_splits_the_verdicts() {
     let mut body = unsigned_segment(0x05, b"root", 1);
     let first_len = body.len();
     let mut payload = noise(8_000, 5);
@@ -43,17 +43,41 @@ fn rf01b_a_crafted_valid_page_inside_a_payload_still_splits_the_verdicts() {
     payload[at..at + 4096].copy_from_slice(&level0_page());
     body.extend(unsigned_segment(0x07, &payload, 2));
     assert_eq!(body.len(), total);
-    assert_eq!(verify(&body, &opts()).unwrap_err(), RvfError::PayloadOutOfBounds);
+    let buffered = verify(&body, &opts()).expect("the heuristic falls back to the whole buffer");
 
     let b = builder(12, Order::File);
     let spans = [
-        Span { seg_id: 1, seg_type: 0x05, start: 0, end: first_len, uncompressed: 0 },
-        Span { seg_id: 2, seg_type: 0x07, start: first_len, end: total, uncompressed: 0 },
+        Span {
+            seg_id: 1,
+            seg_type: 0x05,
+            start: 0,
+            end: first_len,
+            uncompressed: 0,
+        },
+        Span {
+            seg_id: 2,
+            seg_type: 0x07,
+            start: first_len,
+            end: total,
+            uncompressed: 0,
+        },
     ];
     let bundle = b.build_spans(&body, &spans);
     let keys = [b.public_key()];
     let run = run_bundle(&bundle, &keys, &opts());
     assert_eq!(run.state, StreamState::Complete);
+    assert_eq!(run.report.as_ref().unwrap(), &buffered, "one verdict");
+
+    // (a) With the signed table, the buffered path needs no heuristic at all.
+    let mut policy = rvm_rvf::stream::StreamPolicy::unpinned_insecure(&keys);
+    policy.size = opts().size_policy;
+    let desc = rvm_rvf::stream::decode_descriptor(&bundle.descriptor, &policy).unwrap();
+    let by_table = rvm_rvf::stream::verify_with_descriptor(&body, &opts(), &desc).unwrap();
+    assert_eq!(&by_table, run.report.as_ref().unwrap());
+    // ... and refuses a buffer that is not the described body.
+    let mut other = body.clone();
+    other[100] ^= 1;
+    assert!(rvm_rvf::stream::verify_with_descriptor(&other, &opts(), &desc).is_err());
 }
 
 /// The other direction: a genuine page appended after real segments is hidden
@@ -71,8 +95,20 @@ fn rf01c_page_handling_other_direction() {
     // then presented as an ordinary segment and must be refused.
     let b = builder(12, Order::File);
     let spans = [
-        Span { seg_id: 1, seg_type: 0x05, start: 0, end: seg_end, uncompressed: 0 },
-        Span { seg_id: 2, seg_type: 0x07, start: seg_end, end: body.len(), uncompressed: 0 },
+        Span {
+            seg_id: 1,
+            seg_type: 0x05,
+            start: 0,
+            end: seg_end,
+            uncompressed: 0,
+        },
+        Span {
+            seg_id: 2,
+            seg_type: 0x07,
+            start: seg_end,
+            end: body.len(),
+            uncompressed: 0,
+        },
     ];
     let bundle = b.build_spans(&body, &spans);
     let keys = [b.public_key()];
@@ -104,9 +140,15 @@ fn profile_record(meta: &[&[u8]]) -> Option<Outcome> {
 fn probe_profile_line_parsing() {
     let yes = Some(Outcome::Fail);
     assert_eq!(profile_record(&[b"rvm.stream_profile=required"]), yes);
-    assert_eq!(profile_record(&[b"a=b\r\nrvm.stream_profile=required\r\n"]), yes);
+    assert_eq!(
+        profile_record(&[b"a=b\r\nrvm.stream_profile=required\r\n"]),
+        yes
+    );
     assert_eq!(profile_record(&[b"\0\nrvm.stream_profile=1"]), yes);
-    assert_eq!(profile_record(&[b"\xFF\xFE\nrvm.stream_profile=required"]), yes);
+    assert_eq!(
+        profile_record(&[b"\xFF\xFE\nrvm.stream_profile=required"]),
+        yes
+    );
     assert_eq!(profile_record(&[b"x", b"rvm.stream_profile=required"]), yes);
     let mut big = vec![b'a'; 3 << 20];
     big.extend_from_slice(b"\nrvm.stream_profile=required");
@@ -146,7 +188,9 @@ mod vec_mut {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     fn hex(s: &str) -> Vec<u8> {
-        (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+        (0..s.len() / 2)
+            .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+            .collect()
     }
     struct Rng(u64);
     impl Rng {
@@ -167,13 +211,19 @@ mod vec_mut {
     fn probe_final_vectors_mutation() {
         let v: serde_json::Value =
             serde_json::from_str(include_str!("vectors/rvsd-v1-vectors.json")).unwrap();
-        let key: [u8; 32] = hex(v["test_only_key"]["public_key_hex"].as_str().unwrap()).try_into().unwrap();
+        let key: [u8; 32] = hex(v["test_only_key"]["public_key_hex"].as_str().unwrap())
+            .try_into()
+            .unwrap();
         let keys = [key];
         let mut rng = Rng(0xABCD_EF01_2345_6789);
         let mut ran = 0;
         for st in v["streams"].as_array().unwrap() {
-            let frames: Vec<Vec<u8>> =
-                st["frames"].as_array().unwrap().iter().map(|f| hex(f["hex"].as_str().unwrap())).collect();
+            let frames: Vec<Vec<u8>> = st["frames"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| hex(f["hex"].as_str().unwrap()))
+                .collect();
             for _ in 0..1500 {
                 let mut fr = frames.clone();
                 for _ in 0..1 + rng.below(3) {

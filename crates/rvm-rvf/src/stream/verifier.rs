@@ -24,6 +24,7 @@ use super::descriptor::{decode_descriptor, VerifiedDescriptor, FLAG_IDENTITY_PRE
 use super::error::{StreamError, StreamResult};
 use super::events::{Event, IdentityStatus, PoisonInfo, StreamState};
 use super::frame::{FRAME_CHUNK, FRAME_CHUNK_TABLE, FRAME_DESCRIPTOR};
+use super::ident::IdentityTracker;
 use super::StreamPolicy;
 use alloc::vec::Vec;
 use sha2::{Digest, Sha256};
@@ -35,13 +36,6 @@ pub(super) struct SegState {
     pub(super) next: u32,
     pub(super) leaves: Option<Vec<u8>>,
     pub(super) done: bool,
-}
-
-#[derive(Clone)]
-pub(super) struct IdentityTracker {
-    pub(super) hasher: Sha256,
-    pub(super) pos: u64,
-    pub(super) feasible: bool,
 }
 
 /// Verifies a stream of frames against a signed descriptor.
@@ -321,11 +315,7 @@ impl<'p> StreamVerifier<'p> {
             .unwrap_or(4 * total_chunks + 64);
         self.left = d.entries.len();
         if h.flags & FLAG_IDENTITY_PRESENT != 0 {
-            self.identity = Some(IdentityTracker {
-                hasher: Sha256::new(),
-                pos: 0,
-                feasible: true,
-            });
+            self.identity = Some(IdentityTracker::new(h.body_len, self.max_chunk_len));
         }
         let ev = Event::DescriptorVerified {
             descriptor_hash: d.descriptor_hash,
@@ -431,8 +421,12 @@ impl<'p> StreamVerifier<'p> {
     }
 
     /// For storage-capable consumers that received chunks out of file order:
-    /// re-read the persisted body in file order and check
-    /// `SHA-256 == rvf_identity`. `read_at(offset, buf)` must fill `buf` or
+    /// re-read the persisted body in file order, check **every chunk against
+    /// the signed leaf and table commitments** (so the confirming bytes must
+    /// equal the streamed bytes) and then check `SHA-256 == rvf_identity`.
+    /// `rvf_identity` is itself a signer assertion: this proves the body matches
+    /// what the signer committed to, not that the signer's claim names the
+    /// package the host meant (that is what `expected_identity` pins). `read_at(offset, buf)` must fill `buf` or
     /// return `false`. Uses a 64 KiB buffer. A mismatch poisons the stream.
     ///
     /// # Errors
@@ -453,20 +447,54 @@ impl<'p> StreamVerifier<'p> {
         {
             return Err(StreamError::BadState);
         }
-        let h = self.desc.as_ref().expect("descriptor installed").header;
-        let mut hasher = Sha256::new();
+        let (h, entries) = {
+            let d = self.desc.as_ref().expect("descriptor installed");
+            (d.header, d.entries.clone())
+        };
+        let mut body_hash = IdentityTracker::new(h.body_len, 65536);
         let mut buf = alloc::vec![0u8; 65536];
-        let mut pos = 0u64;
-        while pos < h.body_len {
-            let n = (h.body_len - pos).min(buf.len() as u64) as usize;
-            if !read_at(pos, &mut buf[..n]) {
-                return Err(StreamError::BadState);
+        // Re-verify the persisted body against the *signed commitments*, chunk
+        // by chunk, while hashing it in file order. Reading is streamed in
+        // 64 KiB pieces whatever the chunk size, so memory stays bounded even
+        // for the segment-granular profile.
+        for (i, e) in entries.iter().enumerate() {
+            let n = self.segs[i].n;
+            for idx in 0..n {
+                let len = h.chunk_len(e.stored_len, idx).unwrap_or(0);
+                let start = e.body_offset + h.chunk_size().map_or(0, |cs| u64::from(idx) * cs);
+                let mut leaf = Sha256::new();
+                leaf.update([super::commit::LEAF_TAG]);
+                leaf.update(h.file_id);
+                leaf.update(e.seg_id.to_le_bytes());
+                leaf.update(idx.to_le_bytes());
+                leaf.update(len.to_le_bytes());
+                let mut done = 0u64;
+                while done < len {
+                    let k = (len - done).min(buf.len() as u64) as usize;
+                    if !read_at(start + done, &mut buf[..k]) {
+                        return Err(StreamError::BadState);
+                    }
+                    leaf.update(&buf[..k]);
+                    body_hash.update(&buf[..k]);
+                    done += k as u64;
+                }
+                let got: [u8; 32] = leaf.finalize().into();
+                let mut want = e.chunk_table_hash;
+                if let Some(l) = &self.segs[i].leaves {
+                    want.copy_from_slice(&l[idx as usize * 32..idx as usize * 32 + 32]);
+                }
+                if !bool::from(got.ct_eq(&want)) {
+                    // The persisted body is not the one that was streamed.
+                    self.force_poison(StreamError::ChunkHashMismatch, Some(e.seg_id), idx);
+                    return Err(StreamError::ChunkHashMismatch);
+                }
             }
-            hasher.update(&buf[..n]);
-            pos += n as u64;
         }
-        let got: [u8; 32] = hasher.finalize().into();
-        if !bool::from(got.ct_eq(&h.rvf_identity)) {
+        let confirmed = body_hash.feasible
+            && body_hash
+                .digest()
+                .is_some_and(|got| bool::from(got.ct_eq(&h.rvf_identity)));
+        if !confirmed {
             // Explicit retroactive revocation of an unconfirmed artifact.
             self.force_poison(StreamError::IdentityMismatch, None, 0);
             return Err(StreamError::IdentityMismatch);

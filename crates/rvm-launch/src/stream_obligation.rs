@@ -41,11 +41,12 @@ pub struct Discharged {
 }
 
 impl PoisonObligation {
-    /// An obligation for `session_id` covering `handles` that the host
-    /// installed under that session by some path other than
-    /// [`StreamSession::install_capabilities`](crate::StreamSession::install_capabilities)
-    /// (for example a host that installs capabilities in several tables).
-    pub fn for_session(session_id: u64, handles: Vec<(u32, u32)>) -> Self {
+    /// An obligation for `session_id` covering `handles`. Crate-private: only
+    /// the session that owns the id can issue one (a public constructor with a
+    /// guessable sequential id would let any caller name another tenant's
+    /// session).
+    #[cfg(test)]
+    pub(crate) fn for_session(session_id: u64, handles: Vec<(u32, u32)>) -> Self {
         Self {
             session_id,
             handles,
@@ -73,11 +74,33 @@ impl PoisonObligation {
         log: &WitnessLog<N>,
         timestamp_ns: u64,
     ) -> LaunchResult<Discharged> {
-        let revoked = self
-            .handles
-            .iter()
-            .filter(|(index, generation)| caps.remove(*index, *generation).is_ok())
-            .count();
+        let mut gone: Vec<u32> = Vec::new();
+        for (index, generation) in &self.handles {
+            if caps.remove(*index, *generation).is_ok() {
+                gone.push(*index);
+            }
+        }
+        // Capabilities derived from the revoked roots go too: sweep the table
+        // for slots whose parent was just removed, until none is left. (A
+        // slot records its parent's index but not its generation; the sweep
+        // runs at once, before any slot can be reused.)
+        let mut revoked = gone.len();
+        loop {
+            let children: Vec<(u32, u32)> = caps
+                .iter()
+                .filter(|(_, slot)| slot.depth > 0 && gone.contains(&slot.parent_index))
+                .map(|(index, slot)| (index, slot.generation))
+                .collect();
+            if children.is_empty() {
+                break;
+            }
+            for (index, generation) in children {
+                if caps.remove(index, generation).is_ok() {
+                    gone.push(index);
+                    revoked += 1;
+                }
+            }
+        }
         let mut terminated = 0;
         for i in instances.iter_mut() {
             if i.stream_origin().map(|o| o.session_id) == Some(self.session_id)
@@ -93,3 +116,7 @@ impl PoisonObligation {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "stream_obligation_tests.rs"]
+mod tests;

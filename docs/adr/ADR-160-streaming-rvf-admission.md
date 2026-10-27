@@ -204,3 +204,93 @@ the Decision above disagree, this section records what was built and why.
     mutated while borrowed); the guarantee ends at an FFI or shared-memory
     boundary, where the caller must copy into verifier-owned memory first. No
     extra copy is made on the safe path.
+14. **Replay protection, round 2 (RV2-01, RV2-02).** Pins are keyed by
+    `(signer_key_id, file_id)`: a second trusted signer publishing the same
+    `file_id` has its own pin and can neither displace nor bypass another's
+    (the reference does the same: an `EpochPin` applies only to its signer and
+    `file_id`, and its descriptor hash is mandatory). `PinStore::advance` is a
+    compare-and-set: it moves a pin only from the value the caller just checked
+    against, and never backwards. The check is no longer only at descriptor
+    arrival: the session re-checks the pin when the identity is verified (a
+    session that began at epoch 4 and finished after epoch 5 was pinned fails
+    with `SessionError::Replay(StaleEpoch)` and a failing witness record), and
+    `take_module` checks again (`take_module_witnessed` writes the record).
+    **The RuVector reference must also:** key its pin lookup by signer as well
+    as file id (it already filters by signer), re-run the epoch comparison when
+    a stream completes and before releasing anything derived from it, and
+    expose a compare-and-set pin update.
+15. **`finish_identity` re-verifies (RV2-03).** It no longer trusts the
+    persisted body: it reads it through `read_at` in 64 KiB pieces, checks
+    **every chunk against the signed leaf and table commitments**, and only
+    then compares `SHA-256` with `rvf_identity`. A descriptor that claims
+    another body's hash is therefore not confirmed by supplying that body. The
+    claim `rvf_identity` is itself a signer assertion; `expected_identity`
+    pins it to the package the host meant. **The reference must also** verify
+    the persisted bytes against the commitments in its `finish_identity`.
+16. **Obligations (RV2-05).** `PoisonObligation::for_session` is crate-private
+    and only `take_obligation` issues one. Discharge sweeps derived
+    capabilities through the table's `parent_index` links (a slot records its
+    parent's index but not its generation; the sweep runs at once, before a
+    slot can be reused). Session ids come from a 32-bit process counter and
+    wrap after 2^32 sessions; a target without 64-bit atomics cannot do better.
+    Pre-descriptor reader poison is witnessed with an all-zero binding, which
+    marks it unauthenticated (RV2-04).
+17. **Root page, round 2 (RF-01b).** A valid-looking trailing page is only a
+    guess, and its CRC is public. The buffered walk now splits the page off
+    only when the segments tile exactly up to it; if the split walk fails the
+    whole buffer is walked instead. A real page always starts on a segment
+    boundary, so the split walk succeeds for it; a "page" crafted inside a
+    payload makes the split walk fail and falls back, so both paths cut the body
+    the same way. This replaces the proposed check of the page's own
+    `l1_manifest_*` fields, which an attacker can also set (they are public
+    values), with a rule that does not depend on any attacker-settable field.
+    When a descriptor is available `verify_with_descriptor` cuts the buffer at
+    the signed table and needs no guess. The differential test
+    (`stream_admission`, `round2::rf01b…`) covers both the heuristic and the
+    descriptor case. The residual: a body with no descriptor and a crafted
+    payload engineered so that *both* the split and the whole walk succeed with
+    different segmentations; the whole-buffer rules (segment alignment, no
+    gaps) leave no such layout that we know of, but there is no proof.
+18. **Optimization pass (measured, 2026-10-26, Ryzen 9 9950X, 32 threads,
+    release, load average 2-4, median of 7 with [min-max]).** Tools: manual
+    timers and an allocator-counting run (`examples/alloc_count.rs`); `perf` is
+    not permitted here (`perf_event_paranoid`).
+    - **Identity hash (file order), `parallel-identity` feature (off by
+      default, needs `std`, `no_std` builds do not compile it).** The second
+      SHA-256 pass (running identity) runs on a worker thread fed copies of the
+      chunks through a queue of 4. Same digest, same verdicts; the digest is
+      complete before the final chunk is released. Chunks over 1 MiB and bodies
+      under 4 MiB are hashed inline. Verifier at 64 KiB chunks: 1.35 [1.31-1.36]
+      to 2.44 [2.31-2.48] GB/s (+81%); at 1 MiB: 1.36 to 2.52 (+85%);
+      admission 1.31 to 2.35, session 1.31 to 2.25-2.34; segment-granular
+      (M1) unchanged (chunks exceed the bound). Peak memory unchanged at 256 MiB
+      (3.6 to 3.7 MiB). Host proxy, file order, unthrottled: module ready
+      54.0 to 33.4 ms (buffered 28.5). The cost is a thread and a copy per
+      chunk; the memory bound is kept by the queue limit.
+    - **SHA-256 backend.** Already hardware: 2.7 GB/s raw (SHA-NI via
+      `cpufeatures`, no feature needed); the portable path would be about
+      0.4 GB/s. No gain available.
+    - **Copies/allocations.** The push path allocates 0.1 (verifier), 0.4
+      (admission), 1.6 (session) times per MiB; nothing avoidable except the
+      module copy the session must keep. The byte reader (`feed`) allocated a
+      new buffer per frame and grew it by doubling: 8716 allocations and 190 MB
+      for 64 MiB at 1500-byte splits; it now reserves the admitted size once and
+      reuses the buffer: 104 allocations, 1.17 MB, throughput 1.13 [1.01-1.14]
+      to 1.18 [1.16-1.18] GB/s (+4%, inside the noise bar; kept for the 160x
+      reduction in allocation).
+    - **Module validator.** 195 MB/s streamed against 183 MB/s whole-buffer
+      `wasmparser`: the wrapper adds nothing measurable; the time is
+      wasmparser's function-body validation. No gain.
+    - **`finish_identity`.** 1.32 [1.31-1.32] GB/s on a 256 MiB body (two
+      SHA-256 passes, 4103 `read_at` calls of 64 KiB); `read_at` buffer size
+      does not matter (16 KiB 1.32, 64 KiB 1.28-1.32, 256 KiB 1.31, 1 MiB 1.24
+      within noise). With `parallel-identity`: 2.19 [2.13-2.24] GB/s. In
+      stage order the confirmation is part of the time to a startable module:
+      host proxy, stage order, unthrottled, 80.2 ms (buffered 28.5), 61.4 ms
+      with the feature; at 1 Gbit/s 591 ms against 567 buffered.
+    - **Honest summary of B3/B4/B5 now:** memory 3.6 MiB against 258.6 MiB
+      (unchanged); verifier 1.35 GB/s default, 2.4-2.5 GB/s with
+      `parallel-identity`; module-ready unthrottled is still slower than the
+      buffered path in file order (33-54 ms against 28.5) and in stage order
+      (61-80 ms), and equal or better only when the link is the bottleneck
+      (file order, 1 Gbit/s: 540 against 567 ms).

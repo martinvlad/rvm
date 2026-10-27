@@ -35,6 +35,9 @@ default = []
 # Producer-side helpers (descriptor builder, synthetic containers) for tests and
 # benches in downstream crates. Never enabled in a production dependency graph.
 testkit = []
+# Overlap the identity SHA-256 with the leaf SHA-256 on a worker thread.
+# Same digest, same verdicts; needs `std`. Off by default; `no_std` unaffected.
+parallel-identity = ["std"]
 std = [
     "rvm-types/std",
     "rvm-cap/std",
