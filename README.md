@@ -952,6 +952,8 @@ crate-by-crate division of responsibility and roadmap.
 
 ### Streaming admission (project Ofer)
 
+> **Published:** `rvm-rvf`, `rvm-wasm`, `rvm-context`, `rvm-host` and `rvm-launch` 0.1.2 are on crates.io (built from tag `ofer-v1`). This PR is not merged, so `main` does not yet contain the release commit.
+
 `rvm-rvf` can admit an RVF **as it arrives**, instead of buffering the whole
 container first. A signed stream descriptor (RuVector
 [ADR-353](https://github.com/ruvnet/RuVector/blob/main/docs/adr/ADR-353-rvf-stream-descriptor.md))
