@@ -357,11 +357,7 @@ pub fn decode_descriptor(
     // A pin binds a lineage: the file id *and* the signer that published it.
     // A descriptor from another signer is not that lineage and is judged by
     // the trust set alone.
-    if let Some(pin) = policy
-        .replay
-        .lookup(&h.file_id)
-        .filter(|p| p.signer_key_id == h.signer_key_id)
-    {
+    if let Some(pin) = policy.replay.lookup(&h.signer_key_id, &h.file_id) {
         if h.epoch < pin.epoch {
             return Err(StreamError::StaleEpoch);
         }

@@ -7,7 +7,7 @@ use crate::stream_obligation::PoisonObligation;
 use crate::stream_session::StreamSession;
 use crate::stream_session_types::{PoisonReport, SessionError, SessionState};
 use rvm_cap::CapabilityTable;
-use rvm_rvf::stream::witness::finish_identity_witnessed;
+use rvm_rvf::stream::witness::{binding_of, emit_event, finish_identity_witnessed, StreamEvent};
 use rvm_rvf::stream::{AdmissionError, IdentityStatus};
 use rvm_rvf::WitnessContext;
 use rvm_types::PartitionId;
@@ -35,7 +35,7 @@ impl StreamSession<'_> {
             .map_err(|e| SessionError::Stream(AdmissionError::Stream(e)));
         self.check_poisoned();
         if r.is_ok() {
-            self.promote();
+            self.promote(None)?;
         }
         r
     }
@@ -55,7 +55,38 @@ impl StreamSession<'_> {
             .map_err(|e| SessionError::Stream(AdmissionError::Stream(e)));
         self.check_poisoned();
         if r.is_ok() {
-            self.promote();
+            self.promote(Some(&|ev: &StreamEvent, b: &[u8; 32]| {
+                emit_event(ev, b, log, ctx);
+            }))?;
+        }
+        r
+    }
+
+    /// [`Self::take_module`], writing a failing witness record if replay
+    /// protection refuses the module at hand-over.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::take_module`].
+    pub fn take_module_witnessed<const N: usize>(
+        &mut self,
+        seg_id: u64,
+        log: &WitnessLog<N>,
+        ctx: WitnessContext,
+    ) -> Result<VerifiedModule, SessionError> {
+        let r = self.take_module(seg_id);
+        if let Err(SessionError::Replay(e)) = &r {
+            if let Some(b) = binding_of(&self.admission) {
+                emit_event(
+                    &StreamEvent::DescriptorRejected {
+                        descriptor_hash: b,
+                        reason: *e,
+                    },
+                    &b,
+                    log,
+                    ctx,
+                );
+            }
         }
         r
     }
@@ -79,6 +110,9 @@ impl StreamSession<'_> {
         if self.identity_status() != Some(IdentityStatus::Verified) {
             return Err(SessionError::IdentityUnverified);
         }
+        // The pin is re-checked here too: a newer epoch pinned since this
+        // session completed makes its module stale.
+        self.pin_check().map_err(SessionError::Replay)?;
         let report = self.admission.report().ok_or(SessionError::Unusable)?;
         let executable = *report
             .executables

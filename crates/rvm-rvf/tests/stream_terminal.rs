@@ -113,7 +113,7 @@ fn an_epoch_pin_binds_its_signer_as_well_as_the_file() {
         descriptor_hash: accepted.descriptor_hash,
         signer_key_id: accepted.header.signer_key_id,
     };
-    let lookup = move |_: &[u8; 16]| Some(pin);
+    let lookup = move |sg: &[u8; 8], _: &[u8; 16]| Some(pin).filter(|p| &p.signer_key_id == sg);
     let mut p = StreamPolicy::unpinned_insecure(&keys);
     p.replay = rvm_rvf::stream::ReplayProtection::Lookup {
         pin: &lookup,
@@ -128,4 +128,29 @@ fn an_epoch_pin_binds_its_signer_as_well_as_the_file() {
     let oa = old.build(&body).unwrap();
     let mut v = StreamVerifier::new(p);
     assert_eq!(v.push(&oa.frames[0]).err(), Some(StreamError::StaleEpoch));
+}
+
+#[test]
+fn the_memory_pin_store_is_keyed_by_signer_and_advances_only_by_compare_and_set() {
+    use rvm_rvf::stream::{MemoryPinStore, PinStore};
+    let store = MemoryPinStore::new();
+    let (a, b, file) = ([1u8; 8], [2u8; 8], [9u8; 16]);
+    let pin = |epoch, signer| EpochPin {
+        epoch,
+        descriptor_hash: [epoch as u8; 32],
+        signer_key_id: signer,
+    };
+    assert!(store.advance(&a, &file, None, pin(5, a)));
+    // Another signer's lineage is separate.
+    assert_eq!(store.lookup(&b, &file), None);
+    assert!(store.advance(&b, &file, None, pin(10, b)));
+    assert_eq!(store.lookup(&a, &file).unwrap().epoch, 5);
+    // A stale expectation loses the race.
+    assert!(!store.advance(&a, &file, None, pin(6, a)));
+    assert!(!store.advance(&a, &file, Some(pin(4, a)), pin(6, a)));
+    // Never backwards, even from the right expectation.
+    assert!(!store.advance(&a, &file, Some(pin(5, a)), pin(4, a)));
+    assert!(store.advance(&a, &file, Some(pin(5, a)), pin(7, a)));
+    assert_eq!(store.lookup(&a, &file).unwrap().epoch, 7);
+    assert_eq!(store.len(), 2);
 }

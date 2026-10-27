@@ -73,8 +73,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use rvm_host::VerifiedPackage;
 use rvm_rvf::stream::witness::{binding_of, emit_event, push_witnessed_with, StreamEvent};
 use rvm_rvf::stream::{
-    AdmissionError, AdmissionEvent, EpochPin, FrameReader, IdentityStatus, PoisonInfo,
-    ReplayProtection, StreamAdmission, StreamPolicy, StreamState,
+    AdmissionError, AdmissionEvent, FrameReader, IdentityStatus, PoisonInfo, ReplayProtection,
+    StreamAdmission, StreamPolicy, StreamState,
 };
 use rvm_rvf::{SizePolicy, VerificationReport, VerifyOptions, WitnessContext};
 use rvm_wasm::{ModuleError, ModulePolicy, StreamingModuleValidator};
@@ -88,7 +88,7 @@ const SEG_TYPE_WASM: u8 = rvm_rvf::format::SEG_TYPE_WASM;
 static NEXT_SESSION: AtomicU32 = AtomicU32::new(1);
 
 /// Writes a stream event to the caller's witness log.
-type Emit<'a> = Option<&'a dyn Fn(&StreamEvent, &[u8; 32])>;
+pub(crate) type Emit<'a> = Option<&'a dyn Fn(&StreamEvent, &[u8; 32])>;
 
 pub(crate) struct ExecProgress {
     validator: StreamingModuleValidator,
@@ -417,48 +417,11 @@ impl<'p> StreamSession<'p> {
         }
         self.pending_package = Some(p);
         self.state = SessionState::Complete;
-        self.promote();
+        self.promote(witness)?;
         Ok(SessionEvent::Complete)
     }
 
-    /// Once the identity is verified: expose the package and pin the
-    /// descriptor. A cut, poisoned or refused stream never gets here, so it
-    /// never moves a pin.
-    pub(crate) fn promote(&mut self) {
-        if self.state == SessionState::Complete
-            && self.identity_status() == Some(IdentityStatus::Verified)
-        {
-            if let Some(p) = self.pending_package.take() {
-                self.package = Some(p);
-            }
-            self.maybe_record_pin();
-        }
-    }
-
-    /// Record the descriptor in the pin store, once.
-    fn maybe_record_pin(&mut self) {
-        if self.pin_recorded
-            || self.state != SessionState::Complete
-            || self.identity_status() != Some(IdentityStatus::Verified)
-        {
-            return;
-        }
-        if let ReplayProtection::Store { store, .. } = self.replay {
-            if let Some(d) = self.admission.verifier().descriptor() {
-                store.record(
-                    &d.header.file_id,
-                    EpochPin {
-                        epoch: d.header.epoch,
-                        descriptor_hash: d.descriptor_hash,
-                        signer_key_id: d.header.signer_key_id,
-                    },
-                );
-                self.pin_recorded = true;
-            }
-        }
-    }
-
-    fn fail(&mut self, e: SessionError) {
+    pub(crate) fn fail(&mut self, e: SessionError) {
         self.state = SessionState::Failed;
         self.exec.clear();
         self.ready.clear();

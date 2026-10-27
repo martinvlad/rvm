@@ -152,11 +152,24 @@ fn split_root_page(data: &[u8]) -> (&[u8], Option<Range<usize>>) {
 /// As [`walk`].
 pub fn walk_container(data: &[u8]) -> RvfResult<WalkedContainer> {
     let (body, root_page) = split_root_page(data);
-    let segments = walk_segments(body)?;
-    Ok(WalkedContainer {
-        segments,
-        root_page,
-    })
+    match walk_segments(body) {
+        Ok(segments) => Ok(WalkedContainer {
+            segments,
+            root_page,
+        }),
+        // A valid-looking page is a guess: the CRC is public, so a payload can
+        // carry one. If the segments do not tile *up to* the supposed page,
+        // the page was not a page, and the whole buffer is the segment area.
+        // (A real page always starts on a segment boundary, so when it is a
+        // page the split walk succeeds and this arm never runs.)
+        Err(e) if root_page.is_some() => walk_segments(data)
+            .map(|segments| WalkedContainer {
+                segments,
+                root_page: None,
+            })
+            .map_err(|_| e),
+        Err(e) => Err(e),
+    }
 }
 
 /// Walk `data` and return every segment in stream order.

@@ -98,6 +98,7 @@ pub mod stream_module;
 pub mod stream_obligation;
 pub mod stream_session;
 mod stream_session_ops;
+mod stream_session_pin;
 mod stream_session_types;
 mod stream_target;
 pub mod witness;

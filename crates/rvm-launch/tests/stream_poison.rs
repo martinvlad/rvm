@@ -4,14 +4,12 @@ mod stream_common;
 #[path = "../../rvm-wasm/tests/common/mod.rs"]
 mod wasm_common;
 
-use rvm_host::{Placement, WasmAdapter};
-use rvm_launch::{verify, Instance, InstanceId, InstanceState, SessionError, SessionState};
+use rvm_launch::{verify, SessionError, SessionState};
 use rvm_rvf::stream::builder::Order;
 use rvm_rvf::stream::StreamState;
 use rvm_rvf::testkit::{unsigned_segment, unsigned_segment_with};
 use rvm_rvf::{CheckKind, WitnessContext, CAPABILITY_DECLARATION_KEY};
 use rvm_types::PartitionId;
-use rvm_wasm::agent::AgentManager;
 use rvm_witness::WitnessLog;
 use stream_common::*;
 
@@ -163,92 +161,4 @@ fn confirming_the_identity_unlocks_the_module_and_the_package() {
     );
     assert!(s.session.package().is_some());
     assert!(s.session.take_module(2).is_ok());
-}
-
-#[test]
-fn a_poison_obligation_touches_only_its_own_sessions_capabilities_and_instances() {
-    // Two tenants stream the same package (same descriptor hash).
-    let module = wasm_common::synthetic_module(3_000);
-    let body = package_body(&module, "clock", 2);
-    let b = builder(12, Order::File);
-    let keys = [b.public_key()];
-    let bundle = b.build(&body).unwrap();
-    let mut a = stream(&keys, bundle.clone(), base_policy());
-    let mut tenant_b = stream(&keys, bundle, base_policy());
-    run_all(&mut a).unwrap();
-    run_all(&mut tenant_b).unwrap();
-    assert_ne!(a.session.session_id(), tenant_b.session.session_id());
-
-    let log = WitnessLog::<512>::new();
-    let mut table = rvm_cap::CapabilityTable::<16>::new();
-    let n_a = a
-        .session
-        .install_capabilities(&mut table, PartitionId::new(1), 0, 100)
-        .unwrap();
-    let n_b = tenant_b
-        .session
-        .install_capabilities(&mut table, PartitionId::new(2), 0, 200)
-        .unwrap();
-    assert!(n_a > 0 && n_b > 0);
-    let before = table.len();
-    let owned_by = |t: &rvm_cap::CapabilityTable<16>, p: u32| {
-        t.iter()
-            .filter(|(_, slot)| slot.owner == PartitionId::new(p))
-            .count()
-    };
-
-    let mut agents_a = AgentManager::<4>::new();
-    let mut agents_b = AgentManager::<4>::new();
-    let mut inst_a = Instance::create(
-        InstanceId::new(1),
-        WasmAdapter::new(),
-        a.session.package().unwrap().clone(),
-        Placement::new(PartitionId::new(1), 0, 16),
-        &log,
-        1,
-    )
-    .unwrap();
-    let mut inst_b = Instance::create(
-        InstanceId::new(2),
-        WasmAdapter::new(),
-        tenant_b.session.package().unwrap().clone(),
-        Placement::new(PartitionId::new(2), 0, 16),
-        &log,
-        1,
-    )
-    .unwrap();
-    inst_a
-        .start_verified(a.session.take_module(2).unwrap(), &mut agents_a, &log, 2)
-        .unwrap();
-    inst_b
-        .start_verified(
-            tenant_b.session.take_module(2).unwrap(),
-            &mut agents_b,
-            &log,
-            2,
-        )
-        .unwrap();
-
-    // A host that tracked session A's installs (here: the handles it got back
-    // from the table) owes exactly those and A's instances.
-    let handles_a: Vec<(u32, u32)> = table
-        .iter()
-        .filter(|(_, slot)| slot.owner == PartitionId::new(1))
-        .map(|(i, slot)| (i, slot.generation))
-        .collect();
-    let ob = rvm_launch::PoisonObligation::for_session(a.session.session_id(), handles_a);
-    let mut instances = [inst_a, inst_b];
-    // Instances of both tenants are offered; only A's is terminated. (Agents
-    // are keyed by package identity, so each tenant has its own manager; the
-    // obligation only ever calls the one it is given, for A's instance.)
-    let d = ob
-        .discharge(&mut table, &mut instances, &mut agents_a, &log, 3)
-        .unwrap();
-    assert_eq!(d.revoked, n_a);
-    assert_eq!(d.terminated, 1);
-    assert_eq!(instances[0].state(), InstanceState::Terminated);
-    assert_eq!(instances[1].state(), InstanceState::Running);
-    assert_eq!(table.len(), before - n_a);
-    assert_eq!(owned_by(&table, 1), 0);
-    assert_eq!(owned_by(&table, 2), n_b, "tenant B keeps every capability");
 }

@@ -204,3 +204,50 @@ the Decision above disagree, this section records what was built and why.
     mutated while borrowed); the guarantee ends at an FFI or shared-memory
     boundary, where the caller must copy into verifier-owned memory first. No
     extra copy is made on the safe path.
+14. **Replay protection, round 2 (RV2-01, RV2-02).** Pins are keyed by
+    `(signer_key_id, file_id)`: a second trusted signer publishing the same
+    `file_id` has its own pin and can neither displace nor bypass another's
+    (the reference does the same: an `EpochPin` applies only to its signer and
+    `file_id`, and its descriptor hash is mandatory). `PinStore::advance` is a
+    compare-and-set: it moves a pin only from the value the caller just checked
+    against, and never backwards. The check is no longer only at descriptor
+    arrival: the session re-checks the pin when the identity is verified (a
+    session that began at epoch 4 and finished after epoch 5 was pinned fails
+    with `SessionError::Replay(StaleEpoch)` and a failing witness record), and
+    `take_module` checks again (`take_module_witnessed` writes the record).
+    **The RuVector reference must also:** key its pin lookup by signer as well
+    as file id (it already filters by signer), re-run the epoch comparison when
+    a stream completes and before releasing anything derived from it, and
+    expose a compare-and-set pin update.
+15. **`finish_identity` re-verifies (RV2-03).** It no longer trusts the
+    persisted body: it reads it through `read_at` in 64 KiB pieces, checks
+    **every chunk against the signed leaf and table commitments**, and only
+    then compares `SHA-256` with `rvf_identity`. A descriptor that claims
+    another body's hash is therefore not confirmed by supplying that body. The
+    claim `rvf_identity` is itself a signer assertion; `expected_identity`
+    pins it to the package the host meant. **The reference must also** verify
+    the persisted bytes against the commitments in its `finish_identity`.
+16. **Obligations (RV2-05).** `PoisonObligation::for_session` is crate-private
+    and only `take_obligation` issues one. Discharge sweeps derived
+    capabilities through the table's `parent_index` links (a slot records its
+    parent's index but not its generation; the sweep runs at once, before a
+    slot can be reused). Session ids come from a 32-bit process counter and
+    wrap after 2^32 sessions; a target without 64-bit atomics cannot do better.
+    Pre-descriptor reader poison is witnessed with an all-zero binding, which
+    marks it unauthenticated (RV2-04).
+17. **Root page, round 2 (RF-01b).** A valid-looking trailing page is only a
+    guess, and its CRC is public. The buffered walk now splits the page off
+    only when the segments tile exactly up to it; if the split walk fails the
+    whole buffer is walked instead. A real page always starts on a segment
+    boundary, so the split walk succeeds for it; a "page" crafted inside a
+    payload makes the split walk fail and falls back, so both paths cut the body
+    the same way. This replaces the proposed check of the page's own
+    `l1_manifest_*` fields, which an attacker can also set (they are public
+    values), with a rule that does not depend on any attacker-settable field.
+    When a descriptor is available `verify_with_descriptor` cuts the buffer at
+    the signed table and needs no guess. The differential test
+    (`stream_admission`, `round2::rf01b…`) covers both the heuristic and the
+    descriptor case. The residual: a body with no descriptor and a crafted
+    payload engineered so that *both* the split and the whole walk succeed with
+    different segmentations; the whole-buffer rules (segment alignment, no
+    gaps) leave no such layout that we know of, but there is no proof.

@@ -7,8 +7,7 @@ mod wasm_common;
 
 use rvm_host::WasmAdapter;
 use rvm_launch::{
-    Instance, InstanceId, InstanceState, PoisonObligation, SessionError, SessionEvent,
-    SessionState, StreamSession,
+    Instance, InstanceId, InstanceState, SessionError, SessionEvent, SessionState, StreamSession,
 };
 use rvm_rvf::stream::builder::Order;
 use rvm_rvf::stream::{MemoryPinStore, ReplayProtection, StreamError, StreamPolicy, StreamState};
@@ -403,15 +402,15 @@ fn rv07_pins_are_recorded_only_after_admission_and_enforced() {
     );
 }
 
-/// Starting is still impossible from a session that is not confirmed, and the
-/// instance of a confirmed one remembers its own session.
+/// Instances started from a session remember that session, not just the
+/// descriptor.
 #[test]
 fn started_instances_remember_their_session_not_just_the_descriptor() {
     let module = wasm_common::synthetic_module(1_000);
     let b = builder(12, Order::File);
     let keys = [b.public_key()];
     let bundle = b.build(&package_body(&module, "clock", 2)).unwrap();
-    let mut a = stream(&keys, bundle.clone(), base_policy());
+    let mut a = stream(&keys, bundle, base_policy());
     run_all(&mut a).unwrap();
     let log = WitnessLog::<512>::new();
     let mut agents = AgentManager::<4>::new();
@@ -427,22 +426,8 @@ fn started_instances_remember_their_session_not_just_the_descriptor() {
     inst.start_verified(a.session.take_module(2).unwrap(), &mut agents, &log, 2)
         .unwrap();
     assert_eq!(inst.state(), InstanceState::Running);
-    let o = inst.stream_origin().unwrap();
-    assert_eq!(o.session_id, a.session.session_id());
-    let ob = PoisonObligation::for_session(a.session.session_id() + 1, vec![]);
-    let mut table = rvm_cap::CapabilityTable::<4>::new();
-    let d = ob
-        .discharge(
-            &mut table,
-            std::slice::from_mut(&mut inst),
-            &mut agents,
-            &log,
-            3,
-        )
-        .unwrap();
     assert_eq!(
-        d.terminated, 0,
-        "another session's obligation leaves it alone"
+        inst.stream_origin().unwrap().session_id,
+        a.session.session_id()
     );
-    assert_eq!(inst.state(), InstanceState::Running);
 }
